@@ -17,6 +17,28 @@ static inline void transfer_s31_constrained_sta_config(wifi_init_config_t *init)
     init->ampdu_rx_enable = false;
 }
 
+// 微信读书缓存的主用档，也是实测最快的一档：15.37 MB 章节资源包跑到 351.6 KB/s，已经
+// 超过 Mac 跑同一 URL 的 79~91 KB/s，链路吃满，再调射频参数没有空间了。
+// 关键只有两条：动态 RX 抬到 64 槽（惰性分配、优先走 PSRAM，初始化不占内部 RAM），
+// 让接收端在缓冲周转时有回旋余量；静态 TX 压到 3 槽，因为驱动把静态 TX 池当一整块连续
+// DMA 申请，6 槽会先吃掉最大的块，剩下的不够再建静态 RX，直接 "Expected to init 3 rx
+// buffer, actual is 0" ESP_ERR_NO_MEM。缓存会话纯下行，用不到 6 个 TX 槽。
+// AMPDU 与 6 槽静态 RX 实测是退步（tar 277.2 KB/s、端到端 173.4s，对 351.6 KB/s / 139.1s），
+// 已删掉：动态 RX 64 槽才是那个杠杆，聚合窗口只把重排序缓冲压得更紧。
+// The primary WeRead cache profile and the fastest measured one: 15.37 MB of chapter tarballs
+// at 351.6 KB/s, above what a Mac reaches on the same URL (79~91 KB/s), so the link is already
+// saturated. Two settings matter: 64 dynamic RX slots (lazily allocated from PSRAM, so init
+// costs no internal RAM) give the receiver headroom, and 3 static TX slots fit because the
+// driver requests the static TX pool as one contiguous DMA block. AMPDU plus 6 static RX slots
+// measured as a regression (277.2 KB/s, 173.4s end to end) and was removed.
+static inline void transfer_s31_thrifty_sta_config(wifi_init_config_t *init) {
+    if (!init) return;
+    if (init->static_rx_buf_num > 3) init->static_rx_buf_num = 3;
+    if (init->static_tx_buf_num > 3) init->static_tx_buf_num = 3;
+    if (init->dynamic_rx_buf_num < 64) init->dynamic_rx_buf_num = 64;
+    init->ampdu_rx_enable = false;
+}
+
 static inline esp_err_t transfer_s31_radio_profile(wifi_interface_t interface) {
     esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
     if (err == ESP_OK) err = esp_wifi_set_protocol(interface,

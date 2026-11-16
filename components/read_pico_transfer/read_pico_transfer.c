@@ -932,10 +932,30 @@ static esp_err_t sync_time_impl(uint32_t *utc_seconds) {
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     init.nvs_enable = false; // 与原厂S31一致；凭据只由本设备设置区管理。/ Reference S31 RAM-only driver config.
     transfer_s31_constrained_sta_config(&init);
-    ESP_LOGI("time_sync", "temporary Wi-Fi rx profile static=%d dynamic=%d ampdu=%d dma_free=%u dma_largest=%u",
-             init.static_rx_buf_num, init.dynamic_rx_buf_num, init.ampdu_rx_enable,
+    /* NTP 只发几个小包，静态 TX 池同样可以压缩：驱动把这池当一整块连续 DMA 申请。
+     * NTP only sends a few small packets, so the static TX pool can shrink: the driver
+     * requests it as one contiguous DMA block. */
+    if (init.static_tx_buf_num > 3) init.static_tx_buf_num = 3;
+    ESP_LOGI("time_sync", "temporary Wi-Fi rx profile static=%d dynamic=%d ampdu=%d tx=%d dma_free=%u dma_largest=%u",
+             init.static_rx_buf_num, init.dynamic_rx_buf_num, init.ampdu_rx_enable, init.static_tx_buf_num,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    /* 静态 RX 缓冲必须来自一块连续的 DMA 内部内存。阅读页打开时面板缓冲会把这块吃到只剩
+     * 几千字节，此时强行初始化不但失败，还会把驱动留在半初始化状态——之后的传书、缓存
+     * 全部起不来（表现为"无法连接 Wi-Fi"）。所以这里先等一小会儿，凑不够就直接跳过这次对时。
+     * Static RX buffers need one contiguous internal DMA block. With the reader page open the
+     * panel buffer leaves only a few KB free; forcing init there fails and leaves the driver
+     * half-initialised, which breaks every later session. Wait briefly, then skip. */
+    for (int wait = 0; wait < 12; ++wait) {
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) >= 8u * 1024u) break;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) < 8u * 1024u) {
+        ESP_LOGW("time_sync", "skip: dma largest=%u <8KB, ui holds the block",
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        err = ESP_ERR_NO_MEM;
+        goto time_cleanup;
+    }
     stage="wifi-init";
     err = esp_wifi_init(&init); if (err != ESP_OK) goto time_cleanup;
     wifi_initialized = true;
@@ -1059,8 +1079,16 @@ esp_err_t read_pico_transfer_scan_wifi(read_pico_transfer_network_t out[READ_PIC
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     init.nvs_enable = false; // 与原厂S31一致；凭据只由本设备设置区管理。/ Reference S31 RAM-only driver config.
     transfer_s31_constrained_sta_config(&init);
-    ESP_LOGI("transfer", "wifi scan rx profile static=%d dynamic=%d ampdu=%d",
-             init.static_rx_buf_num, init.dynamic_rx_buf_num, init.ampdu_rx_enable);
+    /* 扫描只收信标，不需要一整套静态 TX 缓冲；而驱动把静态缓冲池作为一整块连续
+     * DMA 内存申请，内部 RAM 碎片化时就是这一步失败（esf_buf_setup_static）。
+     * 只在本函数内压低，传书服务的吞吐配置不受影响。
+     * A scan only receives beacons, so it does not need the full static TX pool: the
+     * driver requests that pool as one contiguous DMA block, and that allocation is
+     * what fails under internal-RAM fragmentation. Local to this function so the
+     * transfer service keeps its throughput profile. */
+    if (init.static_tx_buf_num > 3) init.static_tx_buf_num = 3;
+    ESP_LOGI("transfer", "wifi scan rx profile static=%d dynamic=%d ampdu=%d tx=%d",
+             init.static_rx_buf_num, init.dynamic_rx_buf_num, init.ampdu_rx_enable, init.static_tx_buf_num);
     stage = "wifi-init";
     err = esp_wifi_init(&init); if (err != ESP_OK) goto cleanup;
     initialized = true;
@@ -2323,13 +2351,40 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
     // crashed the radio library or looped on ASSOC_FAIL; with BLE kept on only ~90 KB is free
     // before transfer, so require 128 KB and enable the larger pool only when memory is ample.
     const bool bulk_rx = !cfg->network_only && pre_internal >= 128u * 1024u;
-    const bool constrained_sta = cfg->mode == READ_PICO_TRANSFER_MODE_STA &&
+    // 微信读书缓存是 network_only 的长时间大包下载，按内部 DMA 余量分两档：
+    //   主用档 —— 3 静态 RX + 3 静态 TX + 64 动态 RX，实测 351.6 KB/s（链路已满）
+    //   受限档 —— 上游原来的最小配置，仅作最后兜底
+    // WeRead caching (network_only) is a long bulk download. Two profiles, chosen by the
+    // internal DMA budget: the primary one (3 static RX/TX + 64 dynamic RX, measured at
+    // 351.6 KB/s) and the upstream constrained minimum as the last resort.
+    const bool thrifty_sta = cfg->network_only &&
+        cfg->mode == READ_PICO_TRANSFER_MODE_STA;
+    const bool constrained_sta = !thrifty_sta &&
+        cfg->mode == READ_PICO_TRANSFER_MODE_STA &&
         (pre_internal < min_internal || pre_dma_largest < min_dma_largest);
-    ESP_LOGI("transfer", "wifi pre-init internal free=%u largest=%u dma free=%u largest=%u bulk=%d constrained_sta=%d",
+    ESP_LOGI("transfer", "wifi pre-init internal free=%u largest=%u dma free=%u largest=%u bulk=%d constrained_sta=%d thrifty_sta=%d",
              (unsigned)pre_internal, (unsigned)pre_largest,
-             (unsigned)pre_dma_free, (unsigned)pre_dma_largest, (int)bulk_rx, (int)constrained_sta);
-    if (constrained_sta) transfer_s31_constrained_sta_config(&init);
+             (unsigned)pre_dma_free, (unsigned)pre_dma_largest, (int)bulk_rx, (int)constrained_sta,
+             (int)thrifty_sta);
+    if (thrifty_sta) transfer_s31_thrifty_sta_config(&init);
+    else if (constrained_sta) transfer_s31_constrained_sta_config(&init);
     else transfer_s31_bulk_receive_config(&init, bulk_rx);
+    /* 静态缓冲要占连续 DMA 内部内存。阅读页打开时这块被面板缓冲吃掉，强行初始化会失败并
+     * 把驱动留在半初始化状态，之后所有 Wi-Fi 会话都起不来。先等一会儿，凑不够就明确报错。
+     * Static buffers need a contiguous internal DMA block; with the reader page open it is gone.
+     * Forcing init there poisons the driver, so wait, then fail with a clear message. */
+    for (int wait = 0; wait < 20; ++wait) {
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) >= 8u * 1024u) break;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) < 8u * 1024u) {
+        ESP_LOGW("transfer", "wifi start skipped: dma largest=%u free=%u internal=%u",
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        err = ESP_ERR_NO_MEM;
+        goto fail;
+    }
     err = esp_wifi_init(&init);
     for (int retry = 0; err != ESP_OK && retry < 3; ++retry) {
         ESP_LOGW("transfer", "wifi init retry=%d err=%s internal free=%u largest=%u",
@@ -2338,9 +2393,22 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         (void)esp_wifi_deinit();
         vTaskDelay(pdMS_TO_TICKS(250));
+        if (retry == 0) {
+            /* 初始化失败说明当前档位的静态缓冲申请不到，按档位往下退一步再试。
+             * A failed init means the current profile cannot allocate its static buffers;
+             * step one profile down and retry. */
+            wifi_init_config_t fallback = WIFI_INIT_CONFIG_DEFAULT();
+            fallback.nvs_enable = false;
+            ESP_LOGW("transfer", "wifi thrifty profile failed, falling back to constrained");
+            transfer_s31_constrained_sta_config(&fallback);
+            init = fallback;
+        }
         err = esp_wifi_init(&init);
     }
     if (err != ESP_OK) goto fail;
+    ESP_LOGI("transfer", "wifi rx profile active static_rx=%d static_tx=%d dynamic_rx=%d ampdu=%d ba=%d",
+             init.static_rx_buf_num, init.static_tx_buf_num, init.dynamic_rx_buf_num,
+             (int)init.ampdu_rx_enable, init.rx_ba_win);
     s_wifi = true;
     s_active_static_rx = init.static_rx_buf_num;
     s_active_rx_ba = init.rx_ba_win;

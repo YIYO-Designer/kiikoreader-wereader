@@ -132,6 +132,35 @@ bool wr_reader(const char *book, const char *chapter, wr_reader_t *reader) {
     return ok;
 }
 
+/* psvts 本身就是 _e(时间戳)，协议只要求 ps 与 pc=_e(ct) 不相等。合成一个稍早的
+ * 时间戳就能直接发章节请求，省掉每章一次约 170 KB 的 reader 页下载。
+ * psvts is just _e(timestamp) and the protocol only needs ps != pc = _e(ct). A
+ * synthesized earlier timestamp skips the ~170 KB reader page once per chapter. */
+bool wr_reader_synthetic(const char *book, const char *chapter, wr_reader_t *reader) {
+    char b[128], c[128], epoch[24];
+    memset(reader, 0, sizeof(*reader));
+    if (!encode_id(book, b) || !encode_id(chapter, c)) return false;
+    snprintf(reader->referer, sizeof(reader->referer), WR_HOST "/web/reader/%sk%s", b, c);
+    unsigned now = (unsigned)time(NULL);
+    if (now < 1704067200) return false;
+    snprintf(epoch, sizeof(epoch), "%u", now - 600u);
+    return encode_id(epoch, reader->ps);
+}
+
+/* 真实 reader 页拿到的 ps 只要服务端不跟章节绑定，就能给同一本书后面的章节复用，
+ * 每章省掉一次约 40 KB、1 秒的 reader 页。referer 仍按当前章节重建。
+ * A real ps taken from the reader page can be reused for later chapters of the same
+ * book, skipping the per-chapter reader page; the referer is rebuilt per chapter. */
+bool wr_reader_from_ps(const char *book, const char *chapter, const char *ps, wr_reader_t *reader) {
+    char b[128], c[128];
+    if (!book || !chapter || !ps || !ps[0]) return false;
+    memset(reader, 0, sizeof(*reader));
+    if (!encode_id(book, b) || !encode_id(chapter, c)) return false;
+    snprintf(reader->referer, sizeof(reader->referer), WR_HOST "/web/reader/%sk%s", b, c);
+    snprintf(reader->ps, sizeof(reader->ps), "%s", ps);
+    return true;
+}
+
 static bool content_body(const char *book, const char *chapter, const wr_reader_t *reader, char out[1000]) {
     char b[128], c[128], pc[128], epoch[20], signature[12];
     unsigned now = (unsigned)time(NULL);
@@ -156,6 +185,28 @@ static bool shard_valid(const char *body, size_t length) {
     char hash[33];
     md5(body+32, length-32, hash);
     return !strncasecmp(hash, body, 32);
+}
+
+/* 分片被拒时把响应体打出来。服务端拒绝一章时回的是几十字节的 JSON（限流、下架、
+ * 会话失效都会走这条路），而日志原来只有 Content-Length，分不出是哪一种。
+ * 只打可打印 ASCII，二进制字节换成点，长度上限 200，避免把大响应刷进日志。
+ * Dump a rejected body: a refusal is a few dozen bytes of JSON, and the log only carried
+ * Content-Length, which cannot tell throttling from a delisted chapter. Printable ASCII only. */
+static void shard_reject(const char *endpoint, const char *body, size_t length) {
+    if (!body) {
+        ESP_LOGW("WEREAD", "shard reject endpoint=%s bytes=%u body=<null>",
+                 endpoint, (unsigned)length);
+        return;
+    }
+    char text[201];
+    size_t used = length < 200 ? length : 200;
+    for (size_t i = 0; i < used; ++i) {
+        unsigned char c = (unsigned char)body[i];
+        text[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+    }
+    text[used] = 0;
+    ESP_LOGW("WEREAD", "shard reject endpoint=%s bytes=%u body=%s",
+             endpoint, (unsigned)length, text);
 }
 
 static bool restore_order(char *data, size_t size) {
@@ -229,17 +280,27 @@ char *wr_chapter_content(const char *book, const char *chapter, const wr_reader_
     const char *const *endpoints = *plain ? text : epub;
     unsigned shards = *plain ? 2 : 3;
     if (*plain) { free(data); data = wr_http(text[0], json, reader->referer, limit, &n); }
-    if (!shard_valid(data, n)) { free(data); return NULL; }
+    if (!shard_valid(data, n)) {
+        shard_reject(endpoints[0], data, n);
+        free(data);
+        return NULL;
+    }
     size_t used = n-33;
     memmove(data, data+33, used);
     for (unsigned i = 1; i < shards; ++i) {
-        char *shard = wr_http(endpoints[i], json, reader->referer, limit, &n);
-        bool valid = shard_valid(shard, n) && n-32 <= limit-used;
-        char *grown = valid ? heap_caps_realloc(data, used+n-31, MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT) : NULL;
+        /* wr_http 失败时不写长度，用局部变量接，别让上一个分片的 n 冒充本次长度。
+         * wr_http leaves the length untouched on failure, so take a local so the previous
+         * shard's count cannot stand in for this one. */
+        size_t shard_bytes = 0;
+        char *shard = wr_http(endpoints[i], json, reader->referer, limit, &shard_bytes);
+        const bool shard_ok = shard_valid(shard, shard_bytes);
+        if (!shard_ok) shard_reject(endpoints[i], shard, shard_bytes);
+        char *grown = shard_ok && shard_bytes-32 <= limit-used
+            ? heap_caps_realloc(data, used+shard_bytes-31, MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT) : NULL;
         if (!grown) { free(shard); free(data); return NULL; }
         data = grown;
-        memcpy(data+used, shard+32, n-32);
-        used += n-32;
+        memcpy(data+used, shard+32, shard_bytes-32);
+        used += shard_bytes-32;
         free(shard);
     }
     if (!restore_order(data, used) || !(*length = decode_base64(data, used))) { free(data); return NULL; }

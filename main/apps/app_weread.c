@@ -9,7 +9,10 @@
 #include "app_transfer_mode.h"
 #include "book_cover.h"
 #include "book_store.h"
+#include "display.h"
+#include "e0470_epaper_waveform.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "settings.h"
 #include "ui_gesture.h"
@@ -42,6 +45,33 @@ static char s_open[WR_PATH], s_offline[WR_PATH], s_qr[180];
 static const char *s_message;
 static uint8_t *s_cover_pixels;
 static unsigned s_done, s_total;
+/* ============================ 缓存进度刷新的两档实现 ============================
+ * WR_PROGRESS_AREA 0 —— 81.5 s 基线档：进度跨 5% 返回 APP_REDRAW_PAGE，走整屏 48 帧波形
+ *   （单次 580~700 ms，带一次反相闪屏）。32 章的书刷 20 次，合计 13.1 s 面板时间。
+ * WR_PROGRESS_AREA 1 —— 局部档：tick 先把 fb 画好，再返回 APP_REDRAW_AREA，只推进度块
+ *   （差分 DU，约 100 ms，无反相）。32 次合计约 3 s，全程不闪；每 16 次补一次 GL16 沉淀。
+ * 0 = baseline (full 48-frame page refresh per 5% step, 13.1 s per 32-chapter book).
+ * 1 = partial push of the progress box only (diff DU, ~100 ms, no inversion, ~3 s). */
+#ifndef WR_PROGRESS_AREA
+#define WR_PROGRESS_AREA 1
+#endif
+
+/* 基线档的节流依据：上一次真正画进进度条的百分比。必须跟"已画出去的值"比，不能跟上一次
+ * tick 的进度比——每章只有 3%，跟上一次比永远跨不过门槛，进度条会一次都不重绘。
+ * Baseline throttle reference: the percentage that was actually painted. Comparing against
+ * the previous tick never crosses the threshold (a chapter is only ~3%), so the bar would
+ * never repaint at all. */
+static unsigned s_drawn_pct;
+#if WR_PROGRESS_AREA
+/* 进度区域：440x24 的进度条（y=482）加居中计数文字（y=542）。只推这一块。
+ * 区域高度按"像素行数"直接换成波形帧数：108 行是 20 帧 / 242 ms，压到 84 行约 16 帧。
+ * The bar at y=482 plus the centred counter at y=542. The waveform frame count scales with
+ * the row count, so 84 rows cost ~16 frames instead of 20. */
+static EpdRect s_progress_area = {112,478,460,84};
+static bool s_progress_pending;     /* 进度已画进 fb，等 present 推上屏 */
+static unsigned s_progress_pushes;  /* 连续 DU 次数，用于周期性 GL16 沉淀 */
+static uint32_t s_progress_ms;      /* 上次推屏时刻，限频用 */
+#endif
 
 #define WR_SESSION_VERIFY_TTL_US (60LL * 1000LL * 1000LL)
 
@@ -126,6 +156,12 @@ static app_redraw_t start(app_ctx_t *ctx, wr_job_t job) {
     s_has_retry = false;
     s_job = job;
     s_done = s_total = 0;
+    s_drawn_pct = 0;
+#if WR_PROGRESS_AREA
+    s_progress_pending = false;
+    s_progress_pushes = 0;
+    s_progress_ms = 0;
+#endif
     s_qr[0] = 0;
     s_view = WORK;
     if (!wr_start(job, &s_selected, s_selected_index, 0)) {
@@ -269,6 +305,21 @@ static bool action_enabled(int action) {
     return action == 0 || action == 4 || (s_logged && (action != 1 || !s_selected_cached));
 }
 
+/* 进度条与计数文字，单独抽出来给局部刷新复用。
+ * The bar and its counter, factored out so the partial refresh can repaint the same pixels. */
+static void draw_progress(uint8_t *fb) {
+    char progress[64];
+    if (s_job == WR_SYNC && !s_total) snprintf(progress,sizeof(progress),"正在连接并获取书架数据…");
+    else if (s_job == WR_SYNC) snprintf(progress,sizeof(progress),"%u / %u 本封面已下载",s_done,s_total);
+    else snprintf(progress,sizeof(progress),"%u / %u",s_done,s_total);
+    EpdRect bar = {122,482,440,24};
+    ui_fill_round_rect(fb,bar,12,0xd8);
+    unsigned pct = !s_total ? 0 : s_done >= s_total ? 100 : (unsigned)(((uint64_t)s_done*100u)/s_total);
+    int fill = (int)((bar.width-4)*pct/100u);
+    if (fill > 0) ui_fill_round_rect(fb,(EpdRect){bar.x+2,bar.y+2,fill,bar.height-4},10,0x50);
+    ui_text_vc(fb,342,542,30,progress,EPD_DRAW_ALIGN_CENTER,false);
+}
+
 static void render(app_ctx_t *ctx, uint8_t *fb) {
     (void)ctx;
     ui_clear_page(fb);
@@ -313,18 +364,7 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         static const char *const labels[] = {"请用微信扫码登录","正在同步书架与封面","正在缓存图文","正在上传本地进度","正在下载云端进度","正在上报阅读时长","正在验证登录状态"};
         ui_text_vc(fb,342,228,29,labels[s_job],EPD_DRAW_ALIGN_CENTER,false);
         if (s_qr[0]) ui_wifi_qr_draw(fb,(EpdRect){137,300,410,410});
-        if (s_total || s_job == WR_SYNC) {
-            char progress[64];
-            if (s_job == WR_SYNC && !s_total) snprintf(progress,sizeof(progress),"正在连接并获取书架数据…");
-            else if (s_job == WR_SYNC) snprintf(progress,sizeof(progress),"%u / %u 本封面已下载",s_done,s_total);
-            else snprintf(progress,sizeof(progress),"%u / %u",s_done,s_total);
-            EpdRect bar = {122,482,440,24};
-            ui_fill_round_rect(fb,bar,12,0xd8);
-            unsigned pct = !s_total ? 0 : s_done >= s_total ? 100 : (unsigned)(((uint64_t)s_done*100u)/s_total);
-            int fill = (int)((bar.width-4)*pct/100u);
-            if (fill > 0) ui_fill_round_rect(fb,(EpdRect){bar.x+2,bar.y+2,fill,bar.height-4},10,0x50);
-            ui_text_vc(fb,342,542,30,progress,EPD_DRAW_ALIGN_CENTER,false);
-        }
+        if (s_total || s_job == WR_SYNC) draw_progress(fb);
         button(fb,action_rect(4),"取消",true);
     }
     /* Status messages are modal: keep them off the shelf artwork so covers and
@@ -385,6 +425,9 @@ static app_redraw_t tick(app_ctx_t *ctx) {
     if (s_view == WORK) {
         if (status != WR_BUSY) {
             ui_wifi_qr_clear();
+#if WR_PROGRESS_AREA
+            s_progress_pending = false;
+#endif
             if (status == WR_OK && s_job == WR_LOGIN) {
                 session_verification_result(status);
                 s_view = ACCOUNT;
@@ -408,6 +451,12 @@ static app_redraw_t tick(app_ctx_t *ctx) {
                 (s_job == WR_CACHE || s_job == WR_UPLOAD || s_job == WR_DOWNLOAD || s_job == WR_SYNC);
             if (s_has_retry) s_retry_job = s_job;
             refresh_shelf();
+            /* 收尾这一帧必须画出来：跟在这行后面的应该是一次 TPS + EpdTiming。日志里没有，
+             * 就说明重绘请求被上面的门挡住了（见 app_loop.c 的 on_tick gated 告警）。
+             * This frame must actually be presented: a TPS + EpdTiming pair should follow. If it
+             * is missing, the redraw request was gated before reaching on_tick. */
+            ESP_LOGI("WEREAD", "ui work done status=%d job=%d view=%d notice=%d",
+                     (int)status, (int)s_job, (int)s_view, (int)(s_message != NULL));
             return APP_REDRAW_PAGE;
         }
         if (strcmp(qr,s_qr)) {
@@ -415,7 +464,35 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             if (*qr) (void)ui_wifi_qr_prepare_text(qr);
             return APP_REDRAW_PAGE;
         }
-        if (done != s_done || total != s_total) { s_done=done; s_total=total; return APP_REDRAW_PAGE; }
+        if (done != s_done || total != s_total) {
+#if WR_PROGRESS_AREA
+            /* 局部档：只推 460x84 的进度区（MODE_DU 差分，约 100 ms、无反相），每章都能跳，
+             * 屏幕全程不闪。250 ms 限频是为了避免同一章的多次 tick 重复推送。
+             * Partial push: only the 460x84 progress box (diff DU, ~100 ms, no inversion), so the
+             * bar can advance on every chapter without flashing. The 250 ms gate just avoids
+             * pushing twice for the same chapter across ticks. */
+            s_done = done;
+            s_total = total;
+            if (ctx->now_ms - s_progress_ms < 250u) return APP_REDRAW_NONE;
+            s_progress_ms = ctx->now_ms;
+            render(ctx, ctx->fb);
+            s_progress_pending = true;
+            return APP_REDRAW_AREA;
+#else
+            /* 基线档（81.5 s 那版）：跨 5% 整屏刷一次，40 章的书约每 6 s 跳一格。收尾那一格
+             * 故意不画——完成分支会连书架带提示一次画完；以前两边都画，两次整屏只隔 63 ms，
+             * 后一帧抢不到面板被丢，屏幕就永久停在进度页。
+             * Baseline: a full refresh per 5% step (about one every 6 s on a 40-chapter book).
+             * The final step is skipped so the completion branch draws shelf + notice in one
+             * uncontested frame; drawing both raced them 63 ms apart and dropped the later one. */
+            const unsigned step = total ? done * 100u / total : 0;
+            s_done = done;
+            s_total = total;
+            if (step < s_drawn_pct + 5u) return APP_REDRAW_NONE;
+            s_drawn_pct = step;
+            return APP_REDRAW_PAGE;
+#endif
+        }
         return APP_REDRAW_NONE;
     }
     if (status == WR_EXPIRED && s_logged) {
@@ -535,11 +612,48 @@ static void media(app_ctx_t *ctx) { (void)ctx; refresh_shelf(); }
 static void lost(app_ctx_t *ctx) { wr_cancel(); media(ctx); }
 static void locking(app_ctx_t *ctx) { (void)ctx; if (s_view == WORK) wr_cancel(); }
 
+#if WR_PROGRESS_AREA
+/* 进度局部刷新：tick 已经把 fb 画好，这里只负责把进度区推上屏。
+ * MODE_DU 没有反相过程，所以缓存全程屏幕不会闪；每 16 次补一次 GL16 沉淀，
+ * 把反复 DU 攒下的残影清掉（收尾的整页刷新也会彻底清一次）。
+ * Partial progress push: tick already painted fb, so only the progress box goes to the panel.
+ * MODE_DU has no inversion phase, so nothing flashes during caching; a GL16 settle every 16
+ * pushes clears the residue that repeated DU leaves behind (the final page refresh clears it
+ * completely as well). */
+static bool present(app_ctx_t *ctx, app_redraw_t redraw) {
+    if (redraw != APP_REDRAW_AREA) return false;
+    const bool pending = s_progress_pending;
+    s_progress_pending = false;
+    if (!pending || s_view != WORK) return false;
+    /* 每 16 次沉淀一次：GL16 单次 48 帧 / 650 ms，比 DU 贵得多，8 次一沉淀等于每轮多花
+     * 2.6 s；收尾的整页刷新本来就会把残影彻底清掉，中途只需要压一次。 */
+    /* Settle every 16 pushes: one GL16 costs 48 frames / 650 ms, far more than a DU, so
+     * settling every 8 added 2.6 s per run. The final page refresh clears the residue
+     * anyway, so one mid-run settle is enough. */
+    const bool settle = ++s_progress_pushes % 16u == 0;
+    /* 差分推送：进度条只增长、数字只变几位，整块推 20 帧 / 242 ms，差分只剩改动的那几行。
+     * Diff push: the bar only grows and a couple of digits change, so a whole-box push costs
+     * 20 frames / 242 ms while a diff only carries the rows that actually changed. */
+    guard_draw_result(ctx->hl, settle
+        ? update_display_area_with(ctx->hl, &E0470_WAVEFORM, MODE_GL16, s_progress_area)
+        : update_display_area_diff_with(ctx->hl, &E0470_WAVEFORM, MODE_DU, s_progress_area));
+    return true;
+}
+
+static EpdRect area_hint(app_ctx_t *ctx) {
+    (void)ctx;
+    return s_progress_area;
+}
+#endif
+
 const app_desc_t app_weread = {
     .title="微信读书", .detail="微信读书书架", .enter_full=true,
     .persistent_navigation=true, .navigation_visible=navigation, .navigation_enabled=navigation,
     .main_page_visible=root,
     .on_enter=enter, .on_exit=leave, .on_tick=tick, .render=render,
+#if WR_PROGRESS_AREA
+    .present=present, .area_hint=area_hint,
+#endif
     .on_nav_reselect=nav_reselect,
     .on_gesture=gesture, .on_key=key, .on_media_lost=lost, .on_media_ready=media,
     .on_before_lock=locking,

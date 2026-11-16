@@ -14,6 +14,11 @@ typedef struct {
 
 typedef struct {
     char id[WR_ID], title[128];
+    /* 章节资源包地址（chapterInfos 的 tar 字段）：一章一个 tar，包里就是这一章的全部插图。
+     * 逐张图去请求 wrepub/epub_<book>_<n> 是 60 次往返，改成一次拿一包。
+     * Per-chapter resource package from the catalog `tar` field: one request carries
+     * every illustration of that chapter instead of one request per image. */
+    char tar[192];
     unsigned index;
 } wr_chapter_t;
 
@@ -22,6 +27,15 @@ typedef enum { WR_IDLE, WR_BUSY, WR_OK, WR_FAILED, WR_EXPIRED, WR_CANCELLED } wr
 
 bool wr_online(void);
 void wr_init(void);
+/* 释放连接池里所有空闲长连接：Wi-Fi 驱动 deinit 后这些 socket 已经是野句柄，
+ * 而且内部 RAM 要腾给射频初始化。 / Drop idle keep-alive sockets before the
+ * radio is re-initialised: they are wild handles afterwards and their internal
+ * RAM is needed by Wi-Fi init. */
+void wr_http_release(void);
+/* 是否有微信读书网络任务在跑。跑的时候连接池里的 TLS 连接占着内部 RAM，
+ * 射频初始化要先等它收尾。 / True while a weread network job runs; its pooled
+ * TLS connections hold internal RAM that Wi-Fi init needs. */
+bool wr_network_busy(void);
 bool wr_account(char id[WR_ID], uint32_t *today, uint64_t *total);
 const char *wr_error_message(void);
 const char *wr_result_message(void);

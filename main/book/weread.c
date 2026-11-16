@@ -31,6 +31,7 @@
 #include "read_pico_sd_access.h"
 #include "read_pico_transfer.h"
 #include "settings.h"
+#include "zlib.h"
 
 #define WR_MAX_SHELF 8192
 #define WR_INDEX WR_DIR "/shelf.bin"
@@ -67,8 +68,6 @@ static bool s_work_pending;
 static bool s_processing_report;
 static bool s_reader_scanning;
 static int64_t s_reader_scan_end;
-static esp_http_client_handle_t s_http_keepalive;
-static char s_http_keepalive_host[128];
 static struct {
     wr_report_t account_book;
     char chapter[WR_ID];
@@ -84,11 +83,9 @@ typedef struct {
     char current[WR_HTTP_URL_BYTES];
     char cookie_snapshot[1024];
     bool capture_service_cookies;
-    bool capture_body;
-    bool body_overflow;
-    bool *post_started;
-    size_t body_limit, body_used, body_capacity;
-    char *body_data;
+    /// 本次请求是否新建了 TCP/TLS 连接；复用池中连接时保持 false。
+    /// Whether this request opened a new TCP/TLS connection; stays false on a pooled one.
+    bool connected;
 } wr_http_context_t;
 static StaticSemaphore_t s_cookie_mutex_storage;
 static SemaphoreHandle_t s_cookie_mutex;
@@ -308,6 +305,13 @@ bool wr_reader_fields_cached(const char *book, const char *chapter, wr_reader_t 
 static esp_err_t capture_cookie(esp_http_client_event_t *event) {
     wr_http_context_t *context = event->user_data;
     if (!context) return ESP_OK;
+    /* ON_CONNECTED 只在真正新建 socket 时派发，是判断连接复用的唯一可靠信号。 */
+    /* ON_CONNECTED fires only for a freshly opened socket, so it is the one reliable
+     * signal that tells a reused keep-alive connection from a new handshake. */
+    if (event->event_id == HTTP_EVENT_ON_CONNECTED) {
+        context->connected = true;
+        return ESP_OK;
+    }
     if (event->event_id != HTTP_EVENT_ON_HEADER || !event->header_key || !event->header_value) return ESP_OK;
     if (!strcasecmp(event->header_key,"Location")) {
         size_t n = strnlen(event->header_value, WR_HTTP_URL_BYTES);
@@ -351,48 +355,93 @@ static esp_err_t capture_cookie(esp_http_client_event_t *event) {
     return ESP_OK;
 }
 
-static void http_keepalive_drop(void) {
-    if (s_http_keepalive) {
-        esp_http_client_cleanup(s_http_keepalive);
-        s_http_keepalive = NULL;
-    }
-    s_http_keepalive_host[0] = 0;
+/* 长连接池：接口域与图片 CDN 是不同主机，单槽会在两类请求交替时被反复驱逐。
+ * 池的生命周期跟随一次后台任务，任务结束即释放，空闲期既不占 TLS 上下文和内部
+ * RAM，也不让射频为了保活一直停在高功耗状态。
+ * A host-keyed keep-alive pool: the API host and the image CDN are different hosts,
+ * so a single slot thrashes whenever the two alternate. The pool lives for one worker
+ * job and is flushed afterwards, so idle time costs neither TLS memory nor radio power. */
+/* 两个下载线程并发时同主机要能各占一条连接，所以槽位数按"并发数 + 接口域"给足。
+ * Slots must cover the concurrent downloaders plus the API host, because same-host
+ * requests running in parallel each need their own live connection. */
+/* 每槽一条活连接，稳定占用几 KB 内部 RAM（收发缓冲 + TLS 上下文），而这块板子的
+ * 内部 RAM 还要喂 Wi-Fi 驱动。并发只有「正文/接口 + 图片」两路，三槽足够。
+ * Each live slot costs a few KB of internal RAM (buffers plus TLS context) and the
+ * Wi-Fi driver competes for the same pool. Concurrency is at most API + CDN, so three
+ * slots cover it. */
+#define WR_HTTP_POOL_SLOTS 3
+/* 空闲超过 20 s 的槽位不再复用：服务端通常 30~75 s 就关掉 keep-alive，而客户端要等到
+ * 写进这条死 socket、把超时耗完才发现（实测每次白等 10 s）。重建一条 TLS 约 600 ms，
+ * 比赌它还活着便宜得多。
+ * Slots idle beyond 20 s are not reused: servers drop keep-alive after 30-75 s while the
+ * client only notices after writing into the dead socket and burning the timeout (10 s per
+ * occurrence in practice). A fresh handshake costs ~600 ms, far cheaper than betting. */
+#define WR_POOL_IDLE_US (20LL * 1000LL * 1000LL)
+typedef struct {
+    esp_http_client_handle_t handle;
+    char host[128];
+    int64_t last_us;
+    /// 有请求正在使用这条连接；并发下载时不能被别的线程抢走。
+    /// A request currently owns this connection; another thread must not take it.
+    bool busy;
+} wr_http_pool_t;
+static wr_http_pool_t s_http_pool[WR_HTTP_POOL_SLOTS];
+static StaticSemaphore_t s_pool_mutex_storage;
+static SemaphoreHandle_t s_pool_mutex;
+
+static void pool_lock(void) {
+    if (s_pool_mutex) (void)xSemaphoreTake(s_pool_mutex, portMAX_DELAY);
+}
+static void pool_unlock(void) {
+    if (s_pool_mutex) (void)xSemaphoreGive(s_pool_mutex);
 }
 
-static esp_err_t capture_keepalive_event(esp_http_client_event_t *event) {
-    wr_http_context_t *request = event ? event->user_data : NULL;
-    if (!request) return ESP_OK;
-    if (event->event_id == HTTP_EVENT_HEADERS_SENT && request->post_started) {
-        *request->post_started = true;
+static void http_pool_flush(void) {
+    esp_http_client_handle_t doomed[WR_HTTP_POOL_SLOTS] = {0};
+    unsigned count = 0;
+    pool_lock();
+    for (unsigned i = 0; i < WR_HTTP_POOL_SLOTS; ++i) {
+        if (s_http_pool[i].handle && !s_http_pool[i].busy) doomed[count++] = s_http_pool[i].handle;
+        if (!s_http_pool[i].busy) {
+            s_http_pool[i].handle = NULL;
+            s_http_pool[i].host[0] = 0;
+            s_http_pool[i].last_us = 0;
+        }
     }
-    if (event->event_id == HTTP_EVENT_ON_DATA && request->capture_body) {
-        if (wr_cancelled()) return ESP_FAIL;
-        if (event->data_len < 0 || (size_t)event->data_len > request->body_limit - request->body_used) {
-            request->body_overflow = true;
-            return ESP_FAIL;
+    pool_unlock();
+    /* cleanup 会发 close 并可能阻塞，放在锁外做。 / Cleanup blocks, so run it outside the lock. */
+    for (unsigned i = 0; i < count; ++i) esp_http_client_cleanup(doomed[i]);
+}
+
+/* 射频要重新初始化前调用：空闲长连接先关掉，别让 socket 越过 Wi-Fi deinit 变成野句柄。
+ * Called before the radio re-initialises: close idle sockets so none survives a Wi-Fi deinit. */
+void wr_http_release(void) { http_pool_flush(); }
+
+/* keep=true 只更新时间戳，TCP/TLS 会话保持打开；keep=false 直接销毁。
+ * keep=true only stamps the slot and leaves the session open; keep=false destroys it. */
+static void http_pool_release(esp_http_client_handle_t http, bool keep) {
+    if (!http) return;
+    bool owned = false, destroy = !keep;
+    pool_lock();
+    for (unsigned i = 0; i < WR_HTTP_POOL_SLOTS; ++i) {
+        if (s_http_pool[i].handle != http) continue;
+        owned = true;
+        if (keep) {
+            /* 句柄留在池里，调用方的请求上下文马上就释放，先摘掉指针避免悬垂。 */
+            (void)esp_http_client_set_user_data(http, NULL);
+            s_http_pool[i].last_us = esp_timer_get_time();
+            s_http_pool[i].busy = false;
+            destroy = false;
+        } else {
+            s_http_pool[i].handle = NULL;
+            s_http_pool[i].host[0] = 0;
+            s_http_pool[i].last_us = 0;
+            s_http_pool[i].busy = false;
         }
-        size_t needed = request->body_used + (size_t)event->data_len;
-        if (needed > request->body_capacity) {
-            size_t next = request->body_capacity ? request->body_capacity : 4096;
-            while (next < needed) {
-                size_t grown = next <= request->body_limit / 2 ? next * 2 : request->body_limit;
-                if (grown <= next) { next = needed; break; }
-                next = grown;
-            }
-            if (next > request->body_limit) next = request->body_limit;
-            char *data = heap_caps_realloc(request->body_data, next + 1,
-                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (!data) return ESP_ERR_NO_MEM;
-            request->body_data = data;
-            request->body_capacity = next;
-        }
-        if (event->data_len) {
-            memcpy(request->body_data + request->body_used, event->data, (size_t)event->data_len);
-            request->body_used += (size_t)event->data_len;
-        }
-        return ESP_OK;
+        break;
     }
-    return capture_cookie(event);
+    pool_unlock();
+    if (destroy || !owned) esp_http_client_cleanup(http);
 }
 
 static bool http_url_host(const char *url, char host[128]) {
@@ -407,161 +456,107 @@ static bool http_url_host(const char *url, char host[128]) {
     return true;
 }
 
-static esp_http_client_handle_t http_keepalive_get(const char *url, wr_http_context_t *request) {
+static esp_http_client_handle_t http_pool_acquire(const char *url, wr_http_context_t *request,
+                                                  bool *matched) {
     char host[128];
-    if (!http_url_host(url, host)) return NULL;
-    if (s_http_keepalive && strcasecmp(host, s_http_keepalive_host)) http_keepalive_drop();
-    if (!s_http_keepalive) {
-        esp_http_client_config_t config = {
-            .url = url, .timeout_ms = 15000, .buffer_size = 4096, .buffer_size_tx = 2048,
-            .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
-            .keep_alive_enable = true, .keep_alive_idle = 10, .keep_alive_interval = 5,
-            .keep_alive_count = 2, .user_agent = WR_AGENT,
-            .event_handler = capture_keepalive_event, .user_data = request,
-        };
-        s_http_keepalive = esp_http_client_init(&config);
-        if (!s_http_keepalive) return NULL;
-        snprintf(s_http_keepalive_host, sizeof(s_http_keepalive_host), "%s", host);
-    } else {
-        if (esp_http_client_set_url(s_http_keepalive, url) != ESP_OK ||
-            esp_http_client_set_event_handler(s_http_keepalive, capture_keepalive_event) != ESP_OK ||
-            esp_http_client_set_user_data(s_http_keepalive, request) != ESP_OK) return NULL;
-    }
-    return s_http_keepalive;
-}
-
-static char *http_request_reusable(wr_http_context_t *request, const char *url, const char *body,
-                                   const char *referer, size_t limit, size_t *length,
-                                   bool *post_started) {
-    request->capture_body = true;
-    request->body_limit = limit;
-    request->post_started = post_started;
-    request->capture_service_cookies = url[0] == '/';
-    bool service = request->capture_service_cookies;
-    char *absolute = request->absolute;
-    const bool upgrade = !service && !strncmp(url, "http://", 7);
-    const char *prefix = service ? WR_HOST : upgrade ? "https://" : "";
-    int n = snprintf(absolute, WR_HTTP_URL_BYTES, "%s%s", prefix, upgrade ? url + 7 : url);
-    if (n < 0 || n >= WR_HTTP_URL_BYTES || (!service && !wr_url_allowed(absolute, false))) {
-        wr_error_set("微信读书请求地址无效");
+    if (!http_url_host(url, host)) {
+        ESP_LOGW("WEREAD", "pool acquire rejected url='%s'", url);
         return NULL;
     }
-    for (const char *p = absolute; *p; ++p) {
-        if ((unsigned char)*p <= ' ' || *p == '\\') {
-            wr_error_set("微信读书请求地址无效");
-            return NULL;
+    *matched = false;
+    esp_http_client_handle_t reuse = NULL;
+    esp_http_client_handle_t evict = NULL;
+    pool_lock();
+    int spare = -1;
+    for (unsigned i = 0; i < WR_HTTP_POOL_SLOTS; ++i) {
+        if (!s_http_pool[i].handle) { if (!s_http_pool[i].busy && spare < 0) spare = (int)i; continue; }
+        if (s_http_pool[i].busy || strcasecmp(host, s_http_pool[i].host)) continue;
+        /* 空闲太久的长连接大概率已被对端关掉，别浪费一次超时。 / An idle socket this old is
+         * most likely closed by the peer; skip it rather than waste a timeout on it. */
+        if (esp_timer_get_time() - s_http_pool[i].last_us > WR_POOL_IDLE_US) {
+            ESP_LOGI("WEREAD", "pool drop idle slot=%u idle_ms=%lld url='%s'", i,
+                     (long long)((esp_timer_get_time() - s_http_pool[i].last_us) / 1000), url);
+            evict = s_http_pool[i].handle;
+            s_http_pool[i].handle = NULL;
+            s_http_pool[i].host[0] = 0;
+            s_http_pool[i].last_us = 0;
+            s_http_pool[i].busy = false;
+            spare = (int)i;
+            break;
         }
+        if (esp_http_client_set_url(s_http_pool[i].handle, url) != ESP_OK ||
+            esp_http_client_set_event_handler(s_http_pool[i].handle, capture_cookie) != ESP_OK ||
+            esp_http_client_set_user_data(s_http_pool[i].handle, request) != ESP_OK) {
+            ESP_LOGW("WEREAD", "pool reuse setup failed url='%s' slot=%u", url, i);
+            evict = s_http_pool[i].handle;
+            s_http_pool[i].handle = NULL;
+            s_http_pool[i].host[0] = 0;
+            s_http_pool[i].last_us = 0;
+            s_http_pool[i].busy = false;
+            if (spare < 0) spare = (int)i;
+            break;
+        }
+        s_http_pool[i].last_us = esp_timer_get_time();
+        s_http_pool[i].busy = true;
+        reuse = s_http_pool[i].handle;
+        break;
     }
-    cookie_lock();
-    memcpy(request->cookie_snapshot, s_cookies, sizeof(request->cookie_snapshot));
-    request->cookie_snapshot[sizeof(request->cookie_snapshot)-1] = 0;
-    cookie_unlock();
-
-    char request_host[128];
-    bool reused = http_url_host(absolute, request_host) && s_http_keepalive &&
-        !strcasecmp(request_host, s_http_keepalive_host);
-    esp_http_client_handle_t http = http_keepalive_get(absolute, request);
-    if (!http) { wr_error_set("无法创建网络请求"); http_keepalive_drop(); return NULL; }
-    esp_http_client_delete_all_headers(http);
-    esp_http_client_reset_redirect_counter(http);
-    esp_http_client_set_method(http, body ? HTTP_METHOD_POST : HTTP_METHOD_GET);
-    esp_http_client_set_header(http, "Accept-Encoding", "identity");
-    esp_http_client_set_header(http, "Referer", referer ? referer : WR_HOST "/");
-    if (service) {
-        esp_http_client_set_header(http, "Accept", "application/json, text/plain, */*");
-        esp_http_client_set_header(http, "Origin", WR_HOST);
-        if (request->cookie_snapshot[0])
-            esp_http_client_set_header(http, "Cookie", request->cookie_snapshot);
+    if (!reuse) {
+        if (spare < 0) {
+            /* 槽位已满：淘汰最久未用且空闲的一条，避免堆更多 TLS 上下文。 */
+            int64_t oldest = 0;
+            int victim = -1;
+            for (unsigned i = 0; i < WR_HTTP_POOL_SLOTS; ++i) {
+                if (s_http_pool[i].busy || !s_http_pool[i].handle) continue;
+                if (victim < 0 || s_http_pool[i].last_us < oldest) {
+                    oldest = s_http_pool[i].last_us;
+                    victim = (int)i;
+                }
+            }
+            if (victim < 0) { pool_unlock(); ESP_LOGW("WEREAD", "pool exhausted url='%s'", url); return NULL; }
+            spare = victim;
+            evict = s_http_pool[spare].handle;
+            s_http_pool[spare].handle = NULL;
+        }
+        s_http_pool[spare].busy = true;
+        s_http_pool[spare].last_us = esp_timer_get_time();
+        snprintf(s_http_pool[spare].host, sizeof(s_http_pool[spare].host), "%s", host);
     }
-    int body_size = body ? (int)strlen(body) : 0;
-    if (body) esp_http_client_set_header(http, "Content-Type", "application/json;charset=UTF-8");
-    if (esp_http_client_set_post_field(http, body, body_size) != ESP_OK) {
-        wr_error_set("无法准备微信读书请求");
-        http_keepalive_drop();
+    pool_unlock();
+    if (reuse) { *matched = true; return reuse; }
+    if (evict) esp_http_client_cleanup(evict);
+    esp_http_client_config_t config = {
+        /* Keep the HTTP/TLS working set modest on S31: the panel and Wi-Fi
+         * driver need internal RAM while mbedTLS allocates AES/GCM contexts. */
+        .url = url, .timeout_ms = 15000, .buffer_size = 4096, .buffer_size_tx = 2048,
+        .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
+        .keep_alive_enable = true, .keep_alive_idle = 30, .keep_alive_interval = 5,
+        .keep_alive_count = 3, .user_agent = WR_AGENT,
+        .event_handler = capture_cookie, .user_data = request,
+    };
+    esp_http_client_handle_t http = esp_http_client_init(&config);
+    if (!http) {
+        pool_lock();
+        if (spare >= 0 && !s_http_pool[spare].handle) {
+            s_http_pool[spare].host[0] = 0;
+            s_http_pool[spare].last_us = 0;
+            s_http_pool[spare].busy = false;
+        }
+        pool_unlock();
+        ESP_LOGW("WEREAD", "pool init failed url='%s' internal=%u largest=%u",
+                 url, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         return NULL;
     }
-    int64_t started = esp_timer_get_time();
-    int code = 0;
-    for (unsigned redirects = 0;;) {
-        request->location[0] = 0;
-        free(request->body_data);
-        request->body_data = NULL;
-        request->body_used = request->body_capacity = 0;
-        request->body_overflow = false;
-        snprintf(request->current, sizeof(request->current), "%s", absolute);
-        if (wr_cancelled()) { wr_error_set("操作已取消"); http_keepalive_drop(); return NULL; }
-        esp_err_t result = esp_http_client_perform(http);
-        if (result != ESP_OK) {
-            int tls_code = 0, tls_flags = 0;
-            esp_err_t tls_error = esp_http_client_get_and_clear_last_tls_error(http, &tls_code, &tls_flags);
-            if (request->body_overflow) wr_error_set("微信读书响应超出允许大小");
-            else if (wr_cancelled()) wr_error_set("操作已取消");
-            else if (tls_error != ESP_OK || result == ESP_ERR_HTTP_CONNECT) {
-                s_http_open_failed = true;
-                wr_error_set("微信读书网络连接失败，请检查 Wi-Fi 后重试");
-            } else wr_error_set("读取微信读书响应失败");
-            ESP_LOGW("WEREAD", "HTTP perform failed url=%s err=%s tls=%s code=%d flags=0x%x bytes=%u",
-                     url, esp_err_to_name(result), esp_err_to_name(tls_error), tls_code,
-                     (unsigned)tls_flags, (unsigned)request->body_used);
-            free(request->body_data);
-            request->body_data = NULL;
-            http_keepalive_drop();
-            return NULL;
-        }
-        code = esp_http_client_get_status_code(http);
-        if (code == 401 || code == 403) {
-            if (service) { s_expired = true; wr_error_set("登录已失效，请重新扫码"); }
-            else wr_error_set("微信读书图片请求未获授权");
-        } else if (code < 200 || code >= 300) wr_error_set("微信读书接口返回错误");
-        bool redirect = code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
-        if (!redirect) break;
-        if (redirects++ >= 5) { wr_error_set("微信读书接口重定向次数过多"); http_keepalive_drop(); return NULL; }
-        char redirected[WR_HTTP_URL_BYTES];
-        if (!service) {
-            if (!cover_redirect_url(request->current, request->location, redirected) ||
-                !wr_url_allowed(redirected, false) || esp_http_client_set_url(http, redirected) != ESP_OK) {
-                wr_error_set("微信读书图片重定向地址不受支持");
-                http_keepalive_drop();
-                return NULL;
-            }
-        } else {
-            if (esp_http_client_set_redirection(http) != ESP_OK ||
-                esp_http_client_get_url(http, redirected, sizeof(redirected)) != ESP_OK ||
-                !wr_url_allowed(redirected, true)) {
-                wr_error_set("微信读书接口重定向失败");
-                http_keepalive_drop();
-                return NULL;
-            }
-        }
-        ESP_LOGI("WEREAD", "HTTP redirect %s -> %s", url, redirected);
-        snprintf(absolute, WR_HTTP_URL_BYTES, "%s", redirected);
-        if (code == 301 || code == 302 || code == 303) {
-            esp_http_client_set_method(http, HTTP_METHOD_GET);
-            esp_http_client_set_post_field(http, NULL, 0);
-            body_size = 0;
-        }
-        free(request->body_data);
-        request->body_data = NULL;
+    pool_lock();
+    if (spare >= 0 && !s_http_pool[spare].handle) {
+        s_http_pool[spare].handle = http;
+        s_http_pool[spare].busy = true;
+        s_http_pool[spare].last_us = esp_timer_get_time();
+        snprintf(s_http_pool[spare].host, sizeof(s_http_pool[spare].host), "%s", host);
     }
-    if (code != 200 || !request->body_data) {
-        if (code == 200 && !request->body_data && request->body_used == 0) {
-            request->body_data = heap_caps_malloc(1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        }
-        if (code != 200 || !request->body_data) {
-            free(request->body_data);
-            request->body_data = NULL;
-            http_keepalive_drop();
-            return NULL;
-        }
-    }
-    request->body_data[request->body_used] = 0;
-    if (length) *length = request->body_used;
-    ESP_LOGI("WEREAD", "HTTP complete url=%s bytes=%u elapsed_ms=%lld connection_reused=%d",
-             request->current, (unsigned)request->body_used,
-             (long long)((esp_timer_get_time() - started) / 1000), reused);
-    char *result = request->body_data;
-    request->body_data = NULL;
-    return result;
+    pool_unlock();
+    return http;
 }
 
 static void restore_session_cookie(void) {
@@ -678,13 +673,70 @@ static bool report_display_busy(void) {
     return busy;
 }
 
-static char *http_request(const char *url, const char *body, const char *referer, size_t limit,
-                          size_t *length, wr_http_chunk_fn chunk, void *context,
-                          bool *fields_received, bool *post_started) {
+/* 响应体阶段的单次读超时，以及滴流看门狗的窗口/最低字节数。
+ * Per-read timeout while streaming a body, plus the trickle watchdog window. */
+#define WR_HTTP_BODY_TIMEOUT_MS  8000
+#define WR_HTTP_STALL_WINDOW_US  6000000
+#define WR_HTTP_STALL_MIN_BYTES  24576
+/* reader 页读完字段后最多再花多久把剩余字节读干（约 4 s / 1 MB）。 */
+#define WR_HTTP_DRAIN_US         4000000
+#define WR_HTTP_DRAIN_LIMIT      (1024 * 1024)
+
+/* 把响应体的剩余字节读干净，让连接可以回到池中复用。返回连接是否可以保留：
+ * 只有读到"完整接收"才算数，超时或用完预算都按不可复用处理。
+ * Drain the rest of the body so the connection can return to the pool. Only a fully
+ * received body counts as reusable; timeouts and exhausted budget are not. */
+static bool drain_response(esp_http_client_handle_t http, int64_t deadline_us) {
+    char scratch[512];
+    size_t dropped = 0;
+    bool reusable = false;
+    (void)esp_http_client_set_timeout_ms(http, 3000);
+    while (!wr_cancelled() && dropped < WR_HTTP_DRAIN_LIMIT) {
+        int n = esp_http_client_read(http, scratch, sizeof(scratch));
+        if (n < 0) break;
+        dropped += (size_t)n;
+        if (esp_http_client_is_complete_data_received(http)) { reusable = true; break; }
+        if (!n || esp_timer_get_time() >= deadline_us) break;
+    }
+    /* 排空用的是短超时，句柄回到池里之前恢复默认值，免得下一次请求开局就被 3 s 掐掉。 */
+    (void)esp_http_client_set_timeout_ms(http, 15000);
+    return reusable;
+}
+
+/* zlib 默认的 32 KB 解压窗口若走内部 RAM 会分配失败，这里全部改走 PSRAM。
+ * zlib's default 32 KB window would come from internal RAM and fail there; use PSRAM. */
+static voidpf gz_alloc(voidpf opaque, uInt items, uInt size) {
+    (void)opaque;
+    return heap_caps_malloc((size_t)items * size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+static void gz_release(voidpf opaque, voidpf address) { (void)opaque; free(address); }
+
+/* 把一段 gzip 字节喂给字段扫描回调；返回 true 表示回调已经取到需要的字段。
+ * Feed one gzip block to the field scanner; true means the scanner has what it needs. */
+static bool gz_scan(z_stream *stream, const char *input, size_t length, char *out, size_t out_size,
+                    wr_http_chunk_fn chunk, void *context, bool *error) {
+    stream->next_in = (Bytef *)input;
+    stream->avail_in = (uInt)length;
+    while (stream->avail_in) {
+        stream->next_out = (Bytef *)out;
+        stream->avail_out = (uInt)out_size;
+        int status = inflate(stream, Z_SYNC_FLUSH);
+        if (status != Z_OK && status != Z_STREAM_END && status != Z_BUF_ERROR) { *error = true; return false; }
+        size_t produced = out_size - stream->avail_out;
+        if (produced && chunk(out, produced, context)) return true;
+        if (status == Z_STREAM_END) return false;      /* 一条响应只有一条 gzip 流 */
+        if (!produced && status == Z_BUF_ERROR) return false;
+    }
+    return false;
+}
+
+static char *http_request_once(const char *url, const char *body, const char *referer, size_t limit,
+                               size_t *length, wr_http_chunk_fn chunk, void *context,
+                               bool *fields_received, bool *post_started, bool *rode_reused) {
     const int64_t request_started_us = esp_timer_get_time();
     s_http_open_failed = false;
     if (wr_cancelled()) { s_error_message = "操作已取消"; return NULL; }
-    if (!wr_online()) { http_keepalive_drop(); s_error_message = "Wi-Fi 未连接或网络尚未就绪"; return NULL; }
+    if (!wr_online()) { http_pool_flush(); s_error_message = "Wi-Fi 未连接或网络尚未就绪"; return NULL; }
     if (url[0] == '/') restore_session_cookie();
     wr_http_context_t *request = heap_caps_calloc(1, sizeof(*request), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!request) { s_error_message = "内存不足，无法创建微信读书请求"; return NULL; }
@@ -710,58 +762,116 @@ static char *http_request(const char *url, const char *body, const char *referer
     memcpy(request->cookie_snapshot, s_cookies, sizeof(request->cookie_snapshot));
     request->cookie_snapshot[sizeof(request->cookie_snapshot)-1] = 0;
     cookie_unlock();
-    /* Keep the proven open/fetch/read path for complete responses. The experimental
-     * esp_http_client_perform() keep-alive path returned non-2xx during a real
-     * WeRead cache request; do not reuse it until the server response is diagnosed. */
-    http_keepalive_drop();
-    esp_http_client_config_t config = {
-        /* Keep the HTTP/TLS working set modest on S31: the panel and Wi-Fi
-         * driver need internal RAM while mbedTLS allocates AES/GCM contexts. */
-        .url = absolute, .timeout_ms = 15000, .buffer_size = 4096, .buffer_size_tx = 2048,
-        /* open/fetch_headers/read is the streaming API; it needs an explicit
-         * redirect loop because perform() is not used here. */
-        .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
-        .user_agent = WR_AGENT, .event_handler = capture_cookie, .user_data = request,
-    };
-    esp_http_client_handle_t http = esp_http_client_init(&config);
-    if (!http) { s_error_message = "无法创建网络请求"; free(request); return NULL; }
-    esp_http_client_set_header(http, "Accept-Encoding", "identity");
-    esp_http_client_set_header(http, "Referer", referer ? referer : WR_HOST "/");
-    if (service) {
-        esp_http_client_set_header(http,"Accept","application/json, text/plain, */*");
-        esp_http_client_set_header(http,"Origin",WR_HOST);
-        if (request->cookie_snapshot[0]) esp_http_client_set_header(http,"Cookie",request->cookie_snapshot);
-    }
-    if (body) {
-        esp_http_client_set_method(http, HTTP_METHOD_POST);
-        esp_http_client_set_header(http, "Content-Type", "application/json;charset=UTF-8");
-    }
+    /* 同一主机的请求复用同一条 TCP/TLS 长连接，不再每次重新握手。只有把响应体
+     * 完整读完的连接才归还池中；提前停止、超限或出错的一律销毁，避免残留字节被
+     * 当成下一个响应的开头（这正是上一版 perform 实验返回异常的主因）。
+     * Same-host requests reuse one TCP/TLS connection instead of a full handshake.
+     * Only a connection whose body was fully drained returns to the pool; early exits,
+     * over-limit bodies and errors are destroyed so stale bytes can never be parsed as
+     * the head of the next response. */
+    esp_http_client_handle_t http = NULL;
+    bool pooled = false;
     char *data = NULL;
     size_t used = 0, capacity = 0;
     int64_t scan_wait_until = 0;
     int64_t reader_deadline = chunk && s_processing_report ? esp_timer_get_time() + 90000000 : 0;
     bool complete = false;
+    /* 服务端用 Connection: close 结束会话时，这条连接不能回池：下一个请求会写进一条
+     * 已经半死的 socket，白等满 8 s 才失败（实测每轮 2 次，合计 16 s）。
+     * A response that ends the session must not return to the pool: the next request would
+     * write into a half-dead socket and burn the full 8 s timeout (2 x per run in practice). */
+    bool no_keep = false;
     bool allocation_failed = false, read_failed = false;
+    /* 只有大响应体（图片、书架 JSON）才需要滴流看门狗，小接口不必背这个判断。 */
+    const bool stall_body = !chunk && limit > 65536;
+    bool stalled = false;
+    int64_t stall_mark_us = esp_timer_get_time();
+    size_t stall_mark_used = 0;
+    /* reader 页走 gzip：解压器只在真的收到压缩响应时才建立。 */
+    z_stream gz_stream;
+    memset(&gz_stream, 0, sizeof(gz_stream));
+    bool gz_live = false, gz_broken = false, gz_tried = false;
+    char *gz_out = NULL;
     // 提前声明：open 失败会 goto cleanup，那里要读 code 决定提示语。
     // Declared up front: the open failure jumps to cleanup, which reads code to pick a message.
     int code = 0;
     int body_size = body ? (int)strlen(body) : 0;
     int64_t declared = -1;
     snprintf(request->current, sizeof(request->current), "%s", absolute);
-    for (unsigned redirects = 0;;) {
+    for (unsigned redirects = 0, reopened = 0;;) {
         request->location[0]=0;
+        if (!http) {
+            bool matched = false;
+            http = http_pool_acquire(absolute, request, &matched);
+            if (!http) {
+                s_error_message = "无法创建网络请求";
+                ESP_LOGW("WEREAD", "request setup failed url=%s absolute=%s", url, absolute);
+                goto cleanup;
+            }
+            pooled = matched;
+            request->connected = false;
+            esp_http_client_delete_all_headers(http);
+            esp_http_client_reset_redirect_counter(http);
+            /* Host/User-Agent 只在 esp_http_client_init 时写入，delete_all_headers 会把
+             * 它们一并删掉；HTTP/1.1 缺 Host 会被服务端直接拒绝，必须按当前 URL 重建。
+             * Host/User-Agent are only defaulted at init time and delete_all_headers drops
+             * them too; HTTP/1.1 without Host is rejected outright, so rebuild both. */
+            char host[128];
+            if (!http_url_host(absolute, host)) { s_error_message = "微信读书请求地址无效"; goto cleanup; }
+            esp_http_client_set_header(http, "Host", host);
+            esp_http_client_set_header(http, "User-Agent", WR_AGENT);
+            esp_http_client_set_method(http, body ? HTTP_METHOD_POST : HTTP_METHOD_GET);
+            /* reader 页是 170 KB 的 HTML，gzip 能把它压到五分之一；其余路径（图片、
+             * tar 资源包、JSON）本身是二进制，压缩没有收益还要多一层解码。
+             * The reader page is ~170 KB of HTML and gzip cuts it to a fifth. Other paths
+             * (images, tar bundles, JSON) are binary, so compression only adds a layer. */
+            esp_http_client_set_header(http, "Accept-Encoding", chunk ? "gzip" : "identity");
+            esp_http_client_set_header(http, "Referer", referer ? referer : WR_HOST "/");
+            if (service) {
+                esp_http_client_set_header(http,"Accept","application/json, text/plain, */*");
+                esp_http_client_set_header(http,"Origin",WR_HOST);
+            }
+            /* 章节资源包（tar）在 res.weread.qq.com 上，和接口共用同一套 Cookie；
+             * 纯图片 CDN 不带也无妨，所以只对 weread 域补。
+             * The chapter resource package lives on res.weread.qq.com and needs the same
+             * cookies as the API; plain image CDN requests do not, so only weread hosts. */
+            if ((service || !strncasecmp(host, "res.weread.qq.com", 18)) && request->cookie_snapshot[0])
+                esp_http_client_set_header(http,"Cookie",request->cookie_snapshot);
+            if (body) esp_http_client_set_header(http, "Content-Type", "application/json;charset=UTF-8");
+            /* 必须每次都调用：复用的连接上一轮可能是 POST，要清掉残留的 post_data/post_len。
+             * Must run every time: a reused handle may still carry the previous POST body.
+             * 但 GET（body==NULL）时 IDF 会走 set_header("Content-Type", NULL) 删除头，头不存在就返回
+             * ESP_ERR_NOT_FOUND——这只说明"本来就没有要删的头"，对 GET 而言正是想要的结果，不能当失败。
+             * For GET, IDF deletes the Content-Type header and returns ESP_ERR_NOT_FOUND when it does not
+             * exist; that is exactly the intended state, so it is not a failure. */
+            esp_err_t post_error = esp_http_client_set_post_field(http, body, body_size);
+            if (post_error != ESP_OK && !(post_error == ESP_ERR_NOT_FOUND && !body)) {
+                s_error_message = "无法准备微信读书请求";
+                ESP_LOGW("WEREAD", "set_post_field failed url=%s body=%d err=%s", url, (int)(body != NULL),
+                         esp_err_to_name(post_error));
+                goto cleanup;
+            }
+        }
         int64_t open_start = esp_timer_get_time();
         esp_err_t open_error = esp_http_client_open(http, body_size);
         if (open_error != ESP_OK) {
-            s_http_open_failed = true;
-            s_error_message = "微信读书网络连接失败，请检查 Wi-Fi 后重试";
             int tls_code = 0, tls_flags = 0;
             esp_err_t tls_error = esp_http_client_get_and_clear_last_tls_error(http, &tls_code, &tls_flags);
-            ESP_LOGW("WEREAD", "HTTP open failed url=%s err=%s ms=%lld tls=%s code=%d flags=0x%x internal=%u largest=%u",
+            ESP_LOGW("WEREAD", "HTTP open failed url=%s err=%s ms=%lld tls=%s code=%d flags=0x%x reused=%d internal=%u largest=%u",
                      url, esp_err_to_name(open_error), (long long)((esp_timer_get_time()-open_start)/1000),
-                     esp_err_to_name(tls_error), tls_code, (unsigned)tls_flags,
+                     esp_err_to_name(tls_error), tls_code, (unsigned)tls_flags, (int)pooled,
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            /* 池里的长连接可能已被服务端或 NAT 静默回收：换一条新连接重试一次。
+             * A pooled connection may already be gone; retry once on a fresh one. */
+            if (pooled && !request->connected && reopened++ == 0) {
+                http_pool_release(http, false);
+                http = NULL;
+                pooled = false;
+                continue;
+            }
+            s_http_open_failed = true;
+            s_error_message = "微信读书网络连接失败，请检查 Wi-Fi 后重试";
             goto cleanup;
         }
         if (post_started && body_size) *post_started = true;
@@ -772,8 +882,24 @@ static char *http_request(const char *url, const char *body, const char *referer
         }
         declared = esp_http_client_fetch_headers(http);
         code = esp_http_client_get_status_code(http);
-        ESP_LOGI("WEREAD", "HTTP %s code=%d declared=%lld chunked=%d", url, code, (long long)declared,
-                 (int)esp_http_client_is_chunked_response(http));
+        ESP_LOGI("WEREAD", "HTTP %s code=%d declared=%lld chunked=%d reused=%d", url, code, (long long)declared,
+                 (int)esp_http_client_is_chunked_response(http), (int)pooled);
+        /* 头名大小写不敏感，IDF 的查找是敏感的，所以两个都试。
+         * Header lookup in IDF is case-sensitive, so try both spellings. */
+        char *conn = NULL;
+        if (esp_http_client_get_header(http, "Connection", &conn) != ESP_OK || !conn)
+            (void)esp_http_client_get_header(http, "connection", &conn);
+        if (conn && !strcasecmp(conn, "close")) {
+            no_keep = true;
+            /* 只在这条连接本来会被复用时才值得记一行：这就是下一次请求卡死的原因。 */
+            /* Only worth a line when this connection would have been pooled: that is
+             * exactly what makes the *next* request stall. */
+            if (pooled) ESP_LOGI("WEREAD", "HTTP close header on reused connection url=%s", url);
+        }
+        /* 是否压缩看响应体的 gzip 魔数，而不是 Content-Encoding 头：IDF 的
+         * esp_http_client_get_header 区分大小写，服务端发的是小写头名，按名字查会漏。
+         * Detect compression from the gzip magic bytes rather than the Content-Encoding
+         * header: IDF header lookup is case-sensitive and the server sends lowercase. */
         bool redirect = code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
         char *redirected = request->redirected;
         if (!redirect) break;
@@ -815,6 +941,11 @@ static char *http_request(const char *url, const char *body, const char *referer
     if ((declared < 0 && !esp_http_client_is_chunked_response(http)) ||
         (declared > 0 && (uint64_t)declared > limit) || code != 200) goto cleanup;
     if (declared < 0) declared = 0;
+    /* 响应体阶段用更短的 socket 超时：一次 recv 卡住 15 s 会让整章空等，
+     * 而正常 Wi-Fi 上读一块数据远用不到 8 s。
+     * A shorter socket timeout while streaming the body: a single stuck recv would
+     * otherwise waste 15 s per attempt, far beyond what Wi-Fi needs for one block. */
+    if (!chunk) esp_http_client_set_timeout_ms(http, WR_HTTP_BODY_TIMEOUT_MS);
     while (!wr_cancelled()) {
         if (chunk) {
             if (reader_deadline && esp_timer_get_time() >= reader_deadline) {
@@ -840,8 +971,45 @@ static char *http_request(const char *url, const char *body, const char *referer
             int n = esp_http_client_read(http, data, (int)(remaining < 2048 ? remaining : 2048));
             if (n < 0) { read_failed = true; goto cleanup; }
             used += (size_t)n;
-            if (n && chunk(data, (size_t)n, context)) {
-                *fields_received = true;
+            bool fields = false;
+            if (n) {
+                if (!gz_tried) {
+                    gz_tried = true;
+                    if (n >= 2 && (uint8_t)data[0] == 0x1f && (uint8_t)data[1] == 0x8b) {
+                        gz_stream.zalloc = gz_alloc;
+                        gz_stream.zfree = gz_release;
+                        if (inflateInit2(&gz_stream, 16 + MAX_WBITS) != Z_OK ||
+                            !(gz_out = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT))) {
+                            gz_broken = true;
+                            s_error_message = "内存不足，无法解压微信读书响应";
+                            ESP_LOGW("WEREAD", "gzip setup failed url=%s internal=%u", url,
+                                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                            goto cleanup;
+                        }
+                        gz_live = true;
+                    }
+                    ESP_LOGI("WEREAD", "reader body magic=%02x%02x gzip=%d declared=%lld",
+                             (unsigned)(uint8_t)data[0], n >= 2 ? (unsigned)(uint8_t)data[1] : 0u,
+                             (int)gz_live, (long long)declared);
+                }
+                if (gz_live) {
+                    fields = gz_scan(&gz_stream, data, (size_t)n, gz_out, 2048, chunk, context, &gz_broken);
+                    if (gz_broken) { read_failed = true; goto cleanup; }
+                } else {
+                    fields = chunk(data, (size_t)n, context);
+                }
+            }
+            if (fields) {
+                if (fields_received) *fields_received = true;
+                /* 拿到字段就停会让响应体残留在 socket 里，连接只能销毁，下一章的
+                 * 第一个分片又得重新握手。这里把剩余字节读干，连接就能回到池中。
+                 * 阅读时长上报走的是同一段扫描，但用户在翻页，不为它多等。
+                 * Stopping at the fields leaves the rest of the body in the socket, so
+                 * the connection must be destroyed and the next chapter pays another
+                 * handshake. Drain the remainder and the connection returns to the pool.
+                 * Reading reports share this scan but the user is turning pages, so they
+                 * do not wait for the drain. */
+                if (!s_processing_report) complete = drain_response(http, esp_timer_get_time() + WR_HTTP_DRAIN_US);
                 break;
             }
             if (!n || esp_http_client_is_complete_data_received(http)) {
@@ -867,30 +1035,85 @@ static char *http_request(const char *url, const char *body, const char *referer
             complete = esp_http_client_is_complete_data_received(http);
             break;
         }
+        /* 慢速滴流看门狗：窗口内拿不到足够字节就主动断线重试。服务端"滴流"时每次
+         * recv 都能在超时前挤几个字节，单次超时永远不触发，于是一次请求白占一分钟。
+         * Slow-trickle watchdog: too few bytes per window means abort and retry. A
+         * dripping server keeps every single recv under the timeout, so the per-recv
+         * timeout alone never fires and one request burns a full minute. */
+        if (stall_body) {
+            int64_t now_us = esp_timer_get_time();
+            if (used - stall_mark_used >= WR_HTTP_STALL_MIN_BYTES) {
+                stall_mark_used = used;
+                stall_mark_us = now_us;
+            } else if (now_us - stall_mark_us >= WR_HTTP_STALL_WINDOW_US) {
+                stalled = true;
+                ESP_LOGW("WEREAD", "HTTP stall abort url=%s bytes=%u/%lld elapsed_ms=%lld reused=%d",
+                         url, (unsigned)used, (long long)declared,
+                         (long long)((esp_timer_get_time() - request_started_us) / 1000), (int)pooled);
+                goto cleanup;
+            }
+        }
     }
 cleanup:
-    esp_http_client_cleanup(http);
+    if (gz_live) inflateEnd(&gz_stream);
+    free(gz_out);
+    /* 只有完整读完响应体、且服务端没说 close 的连接才值得复用。 */
+    /* Reuse only fully drained connections the server did not ask to close. */
+    http_pool_release(http, complete && !no_keep && !wr_cancelled());
+    /* 这次请求真正沿用了池中的长连接：命中了同主机槽位，且没有新建 socket。
+     * The request genuinely rode a pooled connection: same-host slot hit and no new socket. */
+    const bool reused = pooled && !request->connected;
+    if (rode_reused) *rode_reused = reused;
     free(request);
-    if (chunk && (complete || *fields_received) && !wr_cancelled()) {
-        *fields_received = true;
-        ESP_LOGI("WEREAD", "reader HTML bytes=%u full_response=%d", (unsigned)used, complete);
+    if (chunk && (complete || (fields_received && *fields_received)) && !wr_cancelled()) {
+        if (fields_received) *fields_received = true;
+        ESP_LOGI("WEREAD", "reader HTML wire_bytes=%u gzip=%d full_response=%d elapsed_ms=%lld reused=%d", (unsigned)used,
+                 (int)gz_live, (int)complete, (long long)((esp_timer_get_time()-request_started_us)/1000), (int)reused);
         free(data);
         return NULL;
     }
     if (!complete || !data || wr_cancelled()) {
         if (allocation_failed) s_error_message = "内存不足，无法接收微信读书响应";
         else if (read_failed) s_error_message = "读取微信读书响应失败";
+        else if (stalled) s_error_message = "微信读书下载停滞";
         else if (wr_cancelled()) s_error_message = "操作已取消";
         else if (code != 200) { /* Preserve the more specific HTTP/authentication message. */ }
         else s_error_message = "微信读书响应未完整接收";
-        ESP_LOGW("WEREAD", "HTTP read failed url=%s complete=%d bytes=%u", url, (int)complete, (unsigned)used);
+        /* code=0 表示连响应头都没拿到（请求阶段就失败了）；code≠0 才是"连上但读不完整"。
+         * code=0 means the request never reached a response head; otherwise the body was truncated. */
+        ESP_LOGW("WEREAD", "HTTP read failed url=%s code=%d declared=%lld complete=%d bytes=%u reused=%d stalled=%d",
+                 url, code, (long long)declared, (int)complete, (unsigned)used, (int)reused, (int)stalled);
         free(data); return NULL;
     }
     data[used] = 0;
-    ESP_LOGI("WEREAD", "HTTP complete url=%s bytes=%u elapsed_ms=%lld", url, (unsigned)used,
-             (long long)((esp_timer_get_time()-request_started_us)/1000));
+    ESP_LOGI("WEREAD", "HTTP complete url=%s bytes=%u elapsed_ms=%lld connection_reused=%d", url, (unsigned)used,
+             (long long)((esp_timer_get_time()-request_started_us)/1000), (int)reused);
     if (length) *length = used;
     return data;
+}
+
+/* 连接池里的长连接可能已经被服务端悄悄关掉：客户端只有写进这条半死 socket、等满
+ * 超时才失败（实测 7 次 `Connection timed out before data was ready`，全部 reused=1，
+ * 单次白等 10 s，其中一次直接把第 13 章判成失败、整轮 143 s 作废）。这里在非流式
+ * 请求上补一层"丢掉池里所有空闲连接、重新握手再试一次"，流式请求（reader 页要边收
+ * 边扫字段）不重试，靠池的空闲过期来规避。
+ * A pooled keep-alive socket may already be closed by the peer: the client only notices
+ * after writing into the half-dead socket and burning the full timeout (7 x "Connection
+ * timed out before data was ready", all reused=1, 10 s each, one of which failed chapter 13
+ * and threw away a 143 s run). Non-streaming requests therefore flush the pool and retry
+ * once on a fresh handshake. Streaming requests (the reader page scans fields as it arrives)
+ * are not retried; the pool's idle expiry keeps them off stale sockets instead. */
+static char *http_request(const char *url, const char *body, const char *referer, size_t limit,
+                          size_t *length, wr_http_chunk_fn chunk, void *context,
+                          bool *fields_received, bool *post_started) {
+    bool reused = false;
+    char *data = http_request_once(url, body, referer, limit, length, chunk, context,
+                                   fields_received, post_started, &reused);
+    if (data || !reused || chunk != NULL || wr_cancelled() || !wr_online()) return data;
+    ESP_LOGW("WEREAD", "HTTP retry on fresh connection url=%s", url);
+    http_pool_flush();
+    return http_request_once(url, body, referer, limit, length, chunk, context,
+                             fields_received, post_started, NULL);
 }
 
 char *wr_http(const char *url, const char *body, const char *referer, size_t limit, size_t *length) {
@@ -1565,6 +1788,15 @@ wr_result_t wr_status(char *qr, size_t qr_size, unsigned *done, unsigned *total)
     return result;
 }
 
+/* 射频初始化前要确认这里没有活：任务在跑时池里的 TLS 连接会占住几 KB 内部 RAM。 */
+/* Check this before arming the radio: a running job holds pooled TLS connections and their internal RAM. */
+bool wr_network_busy(void) {
+    portENTER_CRITICAL(&s_lock);
+    bool busy = s_work_pending || s_result == WR_BUSY;
+    portEXIT_CRITICAL(&s_lock);
+    return busy;
+}
+
 bool wr_reporting_book(const char *path, wr_book_t *book) {
     char expected[WR_PATH], prefix[16];
     wr_account_t account;
@@ -1682,10 +1914,12 @@ static void worker_task(void *arg) {
         if (work) {
             // 发布完成前，WR_BUSY 保证任务参数不能被覆盖。/ WR_BUSY protects the job until its result is published.
             run_work(&s_work);
-            http_keepalive_drop();
+            /* 任务结束就释放长连接：空闲期不再占 TLS 上下文，也不让射频为保活常驻。 */
+            /* Drop keep-alive sockets once the job ends: no idle TLS memory, no radio keep-alive. */
+            http_pool_flush();
         } else if (slot >= 0) {
             process_report((unsigned)slot, &report);
-            http_keepalive_drop();
+            http_pool_flush();
         } else {
             ulTaskNotifyTake(pdTRUE, pending ? pdMS_TO_TICKS(500) : portMAX_DELAY);
         }
@@ -1695,6 +1929,7 @@ static void worker_task(void *arg) {
 void wr_init(void) {
     if (s_worker) return;
     if (!s_cookie_mutex) s_cookie_mutex = xSemaphoreCreateMutexStatic(&s_cookie_mutex_storage);
+    if (!s_pool_mutex) s_pool_mutex = xSemaphoreCreateMutexStatic(&s_pool_mutex_storage);
     if (!s_cookie_mutex) {
         ESP_LOGE("WEREAD", "cookie mutex initialization failed");
         return;
