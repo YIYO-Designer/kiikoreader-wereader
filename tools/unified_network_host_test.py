@@ -149,7 +149,7 @@ int main(int argc,char **argv) {
         else if (scenario==3) assert(starts==1 && !cellular_ready());
         else if (scenario==4 || scenario==7 || scenario==9) assert(starts==1 && !cellular_ready() && stops);
         else assert(starts==1 && cellular_ready());
-        unsigned before=notifications;cellular_policy_request_restart();assert(notifications==before+1);
+        int before=notifications;cellular_policy_request_restart();assert(notifications==before+1);
     }
     printf("PASS: real boot policy scenario %d\n",scenario);
 }
