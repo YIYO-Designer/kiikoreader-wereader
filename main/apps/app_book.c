@@ -215,7 +215,9 @@ extern const app_desc_t app_device_settings;
 #include "esp_timer.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
+#if KIIKO_BOARD_METALIO47
 #include "freertos/idf_additions.h"
+#endif
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "read_pico_init.h"

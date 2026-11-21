@@ -24,6 +24,8 @@ jobs:
           python3 tools/board_selection_host_test.py
           python3 tools/metalio_font_staging_host_test.py
           python3 tools/metalio_font_recovery_host_test.py
+          python3 tools/reader_font_switch_host_test.py
+          python3 tools/reader_font_recovery_host_test.py
           python3 tools/board_source_view.py --board pico --tests --output build/network-host/pico
           (cd build/network-host/pico && python3 tools/time_service_host_test.py)
 
