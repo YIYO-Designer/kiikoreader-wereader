@@ -31,11 +31,13 @@ typedef int esp_err_t;
 #define pdPASS 1
 typedef void* TaskHandle_t;
 enum { READ_PICO_TRANSFER_MODE_AP, READ_PICO_TRANSFER_MODE_STA };
-typedef struct { bool network_ready; int mode; } read_pico_transfer_status_t;
+enum { READ_PICO_TRANSFER_STOPPED, READ_PICO_TRANSFER_UPLOADING };
+typedef struct { bool network_ready; int mode, state; } read_pico_transfer_status_t;
+static int transfer_state;
 static bool wifi, cell, enabled;
 static int mode = READ_PICO_TRANSFER_MODE_STA;
 static void read_pico_transfer_get_status(read_pico_transfer_status_t *s) {
-    *s=(read_pico_transfer_status_t){wifi,mode};
+    *s=(read_pico_transfer_status_t){.network_ready=wifi,.mode=mode,.state=transfer_state};
 }
 static bool app_settings_cellular_enabled(void) { return enabled; }
 static int app_settings_sim_slot(void) { return 2; }
@@ -216,6 +218,43 @@ int main(void) {
 }
 '''
         subprocess.run([str(compile_case('settings', fixture))], check=True)
+
+        transfer = ROOT / 'components/read_pico_transfer/read_pico_transfer.c'
+        fixture = r'''
+#include <stdatomic.h>
+typedef bool (*external_network_ready_fn)(void);
+static _Atomic(external_network_ready_fn) s_external_network_ready;
+static bool external, s_wifi;
+static void *s_netif=(void*)1;
+static bool external_ready(void) { return external; }
+static void *esp_netif_get_default_netif(void) { return (void*)2; }
+static void time_network_log(void *netif) { assert(netif==(external?(void*)2:(void*)1)); }
+static esp_err_t sync_network_time(uint32_t *utc) { *utc=1800000000;return ESP_OK; }
+'''
+        for name in ('read_pico_transfer_set_external_network_ready',
+                     'transfer_external_network_ready', 'sync_time_online_impl'):
+            fixture += function(name, transfer)
+        fixture += r'''
+int main(void) {
+    uint32_t utc=0;
+    assert(sync_time_online_impl(&utc)==ESP_ERR_INVALID_STATE);
+    read_pico_transfer_set_external_network_ready(external_ready);
+    external=true;
+    assert(sync_time_online_impl(&utc)==ESP_OK && utc==1800000000);
+    transfer_state=READ_PICO_TRANSFER_UPLOADING;
+    assert(sync_time_online_impl(&utc)==ESP_ERR_INVALID_STATE);
+    transfer_state=READ_PICO_TRANSFER_STOPPED;
+    external=false;s_wifi=wifi=true;
+    assert(sync_time_online_impl(&utc)==ESP_OK);
+    mode=READ_PICO_TRANSFER_MODE_AP;
+    assert(sync_time_online_impl(&utc)==ESP_ERR_INVALID_STATE);
+    read_pico_transfer_set_external_network_ready(NULL);
+    external=true;
+    assert(!transfer_external_network_ready());
+    puts("PASS: actual external-link time sync, Wi-Fi fallback, AP/upload exclusion");
+}
+'''
+        subprocess.run([str(compile_case('time-route', fixture))], check=True)
 
 
 if __name__ == '__main__':
