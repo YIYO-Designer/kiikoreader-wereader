@@ -50,3 +50,9 @@ Metalio S31 0.3.3-rc113 最终版 16 MiB 全闪存镜像与 Windows 使用说明
 ## 安全与隐私
 
 请勿提交 Cookie、登录二维码、账户凭据、NVS 导出、设备日志或含有个人书籍信息的截图。发现凭据泄露请立即在微信读书端撤销登录会话，并按 [`SECURITY.md`](SECURITY.md) 报告安全问题。
+
+## 无名 4G 版（3.0.0）
+
+现已同时收录无名 4G 版微读源码。它基于 v3.0.0，增加 EC718 蜂窝网络、双卡选择和 Wi-Fi 优先策略，作为独立源码变体保存在 [`variants/wuming-4g/`](variants/wuming-4g/)。完整功能、源码还原、构建、刷写和卡片限制见 [`docs/WUMING_4G.md`](docs/WUMING_4G.md)，逐文件梳理见 [`docs/WUMING_4G_SOURCE.md`](docs/WUMING_4G_SOURCE.md)。
+
+[v3.0.0 发行版](https://github.com/YIYO-Designer/kiikoreader-wereader/releases/tag/v3.0.0) 额外提供 `Kiikoread_Metalio_S31_4G_full_16MB.bin`，大小 16 MiB，从 `0x0` 写入并清空内部闪存。请根据设备选择普通 S31 或无名 4G 镜像。

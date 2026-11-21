@@ -36,3 +36,7 @@
 ## 仓库边界
 
 本仓库专注固件源码与构建说明。网站、在线刷机页面、历史固件镜像、设备日志、账号数据及本机交接记录不属于源码发布内容。构建生成物应留在 `build/` 并由 `.gitignore` 排除。
+
+## 无名 4G 源码变体
+
+`variants/wuming-4g/overlay/` 保存相对固定 v3.0.0 基线的源码差异；`manifest.json` 记录来源与校验值。`tools/materialize_wuming_4g.py` 还原完整工程到独立目录。详见 [4G 源码梳理](WUMING_4G_SOURCE.md) 和 [构建/刷写说明](WUMING_4G.md)。普通根目录构建不会包含 4G 变体。

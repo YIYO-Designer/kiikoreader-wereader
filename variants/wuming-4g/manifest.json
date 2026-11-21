@@ -1,0 +1,286 @@
+{
+  "variant": "wuming-4g",
+  "version": "3.0.0",
+  "base_commit": "61a1103781267c33719e94d5873d421a1e7d09bf",
+  "board": "metalio47",
+  "source_package": "kiikoread-4g-v3.0.0-release.zip",
+  "source_package_sha256": "7f134b1ff91168337a6502660963d9590a36660e5e4a335b689a6ffcc6300420",
+  "firmware": {
+    "name": "Kiikoread_Metalio_S31_4G_full_16MB.bin",
+    "size": 16777216,
+    "sha256": "d018e213b2eda50ac8945e5a745f88592720e9436e16f7cf26dd562cbf245fe7",
+    "offset": "0x0"
+  },
+  "files": [
+    {
+      "path": "boards/metalio47/sdkconfig.defaults",
+      "change": "modified",
+      "sha256": "4589210155d63a61b029560e54a1ce066b07ce0703751f3fb6d9fa89aeb6197b"
+    },
+    {
+      "path": "boards/metalio47/src/main/app_main.c",
+      "change": "modified",
+      "sha256": "66bee20b52d1ad0fa327392220d0fc2fcf7bfb8a249766c6cc4c6544a20eca37"
+    },
+    {
+      "path": "boards/metalio47/src/main/assets/ui_icons.h",
+      "change": "modified",
+      "sha256": "442789b4670db77d2632c656ad330565a607f4fca7343c1b824a27532b8cb1c8"
+    },
+    {
+      "path": "boards/pico/src/main/assets/ui_icons.h",
+      "change": "modified",
+      "sha256": "5345b65afdec5d0a7208d10bb8f2847a67cfb9806d497967ce49ca9d17ee5a00"
+    },
+    {
+      "path": "components/cellular_modem/CMakeLists.txt",
+      "change": "added",
+      "sha256": "b39c9455cba3531a2e205534df7d292ddc0e64a709d00851f4c02ec56bfe8aeb"
+    },
+    {
+      "path": "components/cellular_modem/include/cellular_modem.h",
+      "change": "added",
+      "sha256": "ecbb422667026a6fcb6719ab2feb8957a19dc2e20e643f8e9af7394faa2062b5"
+    },
+    {
+      "path": "components/cellular_modem/include/uart_eth_modem.h",
+      "change": "added",
+      "sha256": "5129801675646724a0c8f1ac12d027d9fc375d81d98745b5d6d7148a631642ae"
+    },
+    {
+      "path": "components/cellular_modem/src/cellular_modem.cpp",
+      "change": "added",
+      "sha256": "05e8aa5b5562a0c4f5275e7a2f6cdced92589071fd952a5ac595ce4bd36df97d"
+    },
+    {
+      "path": "components/cellular_modem/src/uart_eth_modem.cc",
+      "change": "added",
+      "sha256": "d0b201760c10bde3b7d99074276faa22af28f2c88931b00df0ff562954021f09"
+    },
+    {
+      "path": "components/espressif__iot_eth/CHANGELOG.md",
+      "change": "added",
+      "sha256": "a23d0095bb2326a4852bed959e6affeeffcba4b0038f29ac844ea62f54309510"
+    },
+    {
+      "path": "components/espressif__iot_eth/CMakeLists.txt",
+      "change": "added",
+      "sha256": "80a8b4a790e98ccbd791b0e211e9a349e2e11219620bb74c131daf718fc64481"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/CMakeLists.txt",
+      "change": "added",
+      "sha256": "2bc849f287f41faa0a245fb3746878df13aa123b9203fee43523a60046d45f1e"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/components/app_wifi/app_wifi.c",
+      "change": "added",
+      "sha256": "3dd8344f6a9c3820a94728fc20b8e439aa2f9c2e9f38c0a4f88ba4f500256eab"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/components/app_wifi/CMakeLists.txt",
+      "change": "added",
+      "sha256": "1c72dcb7f630e03daef46a0ca4835c52832b78537ecdf06e5ce591ae5ebeb75c"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/components/app_wifi/include/app_wifi.h",
+      "change": "added",
+      "sha256": "3ffd33faa18a523a9101d4ccb8a57731920eb13a8790456267906de0e6c21951"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/components/app_wifi/Kconfig",
+      "change": "added",
+      "sha256": "3ffb0ff36aca8ba138f7ac317b7998069cefb93d44a4ef0be2535fc37efa92ff"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/main/CMakeLists.txt",
+      "change": "added",
+      "sha256": "e110d4619b7664c964b9b2255bff77a0b92629a1b7f276fef4a326e2895ee88e"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/main/idf_component.yml",
+      "change": "added",
+      "sha256": "267a2ba4e4f07c861bde58cf3091666994b27608f23758b931cd63b93732c8ea"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/main/Kconfig.projbuild",
+      "change": "added",
+      "sha256": "a3c8e209b7f7b44baf1f4037909f6f861a0d6724ffd286ec56cd65ea3edc348b"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/main/usb_rndis_4g_module.c",
+      "change": "added",
+      "sha256": "c41d3993c78660fb311246b3e303d77f1d7cc96770e63ee7cb4e942cacd81047"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/sdkconfig.defaults",
+      "change": "added",
+      "sha256": "6628c9541b08871ecccf04bc76f8b61b6f98d9cfb996a222921f7a750f9d5cdf"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/sdkconfig.defaults.esp32p4",
+      "change": "added",
+      "sha256": "33a33cb72f8c1b7dc4a7a950af4a48cd1b0820b9c2375889b11745e266fc6c7c"
+    },
+    {
+      "path": "components/espressif__iot_eth/examples/usb_rndis_4g_module/sdkconfig.defaults.esp32s3",
+      "change": "added",
+      "sha256": "d55925d3e32f1782c4d728ba5d7ba3053faf244952b48fcc8d677e522a52f077"
+    },
+    {
+      "path": "components/espressif__iot_eth/idf_component.yml",
+      "change": "added",
+      "sha256": "c283116dd4208cd995afebc3f15f5fe664f2554902a80e97f40990c4d8dcbfcf"
+    },
+    {
+      "path": "components/espressif__iot_eth/include/iot_eth.h",
+      "change": "added",
+      "sha256": "b4250d01450fe92b80b408910ee3de845738355a84fd61000dc8f5a0c04fcff6"
+    },
+    {
+      "path": "components/espressif__iot_eth/include/iot_eth_netif_glue.h",
+      "change": "added",
+      "sha256": "e8a2d1a24fc9f335e8424a88f8c365e4e974e42cdb97cd01c5585490d6b17e65"
+    },
+    {
+      "path": "components/espressif__iot_eth/include/iot_eth_types.h",
+      "change": "added",
+      "sha256": "cfa0400356a2dd4c90494035a08f6ae25f7f612dd89962bf5b0334754bd8b343"
+    },
+    {
+      "path": "components/espressif__iot_eth/interface/iot_eth_interface.h",
+      "change": "added",
+      "sha256": "6ee226a9e26f041ad241fd450eb9e345cd83760bf8a19b2ec0036fcfb650fccb"
+    },
+    {
+      "path": "components/espressif__iot_eth/iot_eth.c",
+      "change": "added",
+      "sha256": "531ae2642a63b3d8dab557d54c93f75091fe36b78635f888d2aab541953fa6b2"
+    },
+    {
+      "path": "components/espressif__iot_eth/iot_eth_netif_glue.c",
+      "change": "added",
+      "sha256": "6e2917ece4437c1b0ef7839765292a961ebb9eb35fe78bef1829f15704d355f1"
+    },
+    {
+      "path": "components/espressif__iot_eth/license.txt",
+      "change": "added",
+      "sha256": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5"
+    },
+    {
+      "path": "components/uart_uhci/CMakeLists.txt",
+      "change": "added",
+      "sha256": "b0c5455aba0be8fa85cc6df1793bb40c48e5d05ec829b3e84b47f4047c90b4d1"
+    },
+    {
+      "path": "components/uart_uhci/idf_component.yml",
+      "change": "added",
+      "sha256": "4582d416939b3fb025912bbd074e86aefb9e668e09a39c51eb3561fd6c107498"
+    },
+    {
+      "path": "components/uart_uhci/include/uart_uhci.h",
+      "change": "added",
+      "sha256": "f8fad5012a85acfb47b41163b31a51960402fe6544f01dd1326a9cbf37a957af"
+    },
+    {
+      "path": "components/uart_uhci/README.md",
+      "change": "added",
+      "sha256": "9930f310f7e6a2221c1804b1468702ea53d182b90ba49ce89b4436c01c05143e"
+    },
+    {
+      "path": "components/uart_uhci/README_zh.md",
+      "change": "added",
+      "sha256": "be6b4fb06f2790664aa9c5b546f3692ac0d7c735647439da679399dff278e2d3"
+    },
+    {
+      "path": "components/uart_uhci/src/uart_uhci.cc",
+      "change": "added",
+      "sha256": "3b8c7cca5c74bd28b0fcaa7c8c988a1dc8e629d5a13d4f3b075061dfa3610272"
+    },
+    {
+      "path": "main/app/cellular_policy.c",
+      "change": "added",
+      "sha256": "df7acc37d683af17a037de5a6f7fe1834f2f6252c1827f699b74bd8131435db2"
+    },
+    {
+      "path": "main/app/cellular_policy.h",
+      "change": "added",
+      "sha256": "d1e5a8073b9f60f5fcc81b249ed7be2ac5370129dcb7ca69cc1afa49ca16b6ab"
+    },
+    {
+      "path": "main/apps/app_book.c",
+      "change": "modified",
+      "sha256": "f97f0c4fc08420724e7fd730283c54d840d60043111eec6cf4d9e74b5c020ff0"
+    },
+    {
+      "path": "main/apps/app_cloud_sync.c",
+      "change": "modified",
+      "sha256": "96c94d8801a233ef9ed40838affdfc39248fbedbe11886090ec9c52f4ffb21c6"
+    },
+    {
+      "path": "main/apps/app_device_settings.c",
+      "change": "modified",
+      "sha256": "fa60d1ff829fb28ee93bed0660f178b82f75a336d5626fe73db9ba9bafa651ac"
+    },
+    {
+      "path": "main/apps/app_transfer.c",
+      "change": "modified",
+      "sha256": "62bb75bee94a04a9340d2c0cc412a6f76bcdc6a3bffa6812e2947db256f0fbb2"
+    },
+    {
+      "path": "main/apps/app_weread.c",
+      "change": "modified",
+      "sha256": "21fd5ba80962bdc999289aa855ea8a699e7fee1f99b531a39f9db43e77458a1c"
+    },
+    {
+      "path": "main/book/book_xteink_sync.c",
+      "change": "modified",
+      "sha256": "ebd7af4557fc80e9f015012b9304549b8e17981b9caa73459092277b03dd1c0c"
+    },
+    {
+      "path": "main/book/weread.c",
+      "change": "modified",
+      "sha256": "440d0b7a094fe22e03a28f152111a06119ce1b67be8f53ec749515b3bc6f77f8"
+    },
+    {
+      "path": "main/CMakeLists.txt",
+      "change": "modified",
+      "sha256": "432ec23038f05a73320695cdc8694a3a0ae8740ddcf08e1a429dbeb8d21f951d"
+    },
+    {
+      "path": "main/font/online_font.c",
+      "change": "modified",
+      "sha256": "2e751b6601fe19873459dfc95b86ad21bb20c2e438931f8137755f3e9109d909"
+    },
+    {
+      "path": "main/settings.c",
+      "change": "modified",
+      "sha256": "d6beef4311329f22d92911318037ce0bfbe714b47437e00f2126c174bd2c2be3"
+    },
+    {
+      "path": "main/settings.h",
+      "change": "modified",
+      "sha256": "60d82177f36e5218e4dbf349f6d547041f728fc2031709efdf2307e56c87a7b0"
+    },
+    {
+      "path": "main/ui/ui_nav.c",
+      "change": "modified",
+      "sha256": "fb204f622031f5dde75bf044ea079f7c61c524d7b9b29e60756294f99f8bf4e4"
+    },
+    {
+      "path": "tools/gen_ui_icons.py",
+      "change": "modified",
+      "sha256": "4e5a9f03590f7cbd886bd6fcd36097e64bc8fbf06e6e9f9c03dea21138484fe0"
+    },
+    {
+      "path": "tools/icons/custom/signal-4g.svg",
+      "change": "added",
+      "sha256": "012f73dcdc79ef101ad2584670979a5d0537f61ebfacfeea3df126c79288915a"
+    },
+    {
+      "path": "tools/icons/custom/sim-card.svg",
+      "change": "added",
+      "sha256": "794a620b3c16787fb531f316865947b5d853679ceae26068decd7a2f4f78cdab"
+    }
+  ]
+}

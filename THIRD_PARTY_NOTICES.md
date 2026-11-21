@@ -101,3 +101,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Wuming 4G source overlay
+
+`variants/wuming-4g/overlay/` preserves files supplied in `kiikoread-4g-v3.0.0-release.zip`, based on repository commit `61a1103781267c33719e94d5873d421a1e7d09bf`. Existing notices and license metadata are retained. `cellular_modem` and `cellular_policy` carry Apache-2.0 SPDX markers; `uart_uhci` identifies 78/uart-uhci version 0.2.2 and Apache-2.0 in its component metadata; `espressif__iot_eth` retains its Apache-2.0 `license.txt` and component metadata. Files without an explicit new license remain subject to their existing provenance and applicable terms; this import does not relicense the entire variant. The source manifest records the supplied bytes, not an independently audited upstream provenance chain.

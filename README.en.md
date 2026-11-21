@@ -29,3 +29,9 @@ GitHub Actions runs board builds and host-side checks. Verify the board, partiti
 ## License
 
 Licensing varies by file and component. See [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md); do not treat the whole repository or historical firmware as covered by one license.
+
+## Wuming 4G variant (3.0.0)
+
+The supplied EC718 / ESP32-S31 4G variant is preserved as a pinned v3.0.0 base plus a source overlay in [`variants/wuming-4g/`](variants/wuming-4g/). See [source, build and flashing instructions](docs/WUMING_4G.md) and the [file inventory](docs/WUMING_4G_SOURCE.md). Restore it with `python tools/materialize_wuming_4g.py --output build/wuming-4g/source` before building; the root project still builds the original S31/Pico firmware.
+
+The existing [v3.0.0 release](https://github.com/YIYO-Designer/kiikoreader-wereader/releases/tag/v3.0.0) additionally provides only `Kiikoread_Metalio_S31_4G_full_16MB.bin` (16 MiB, write at `0x0`, erases internal flash). Some bundled IoT SIMs may not reach WeRead; use a compatible external SIM or Wi-Fi. This import does not claim fresh hardware testing.
