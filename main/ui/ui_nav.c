@@ -27,6 +27,7 @@
 #include "ui_click_feedback.h"
 #if KIIKO_BOARD_METALIO47
 #include "metalio_hw.h"
+#include "cellular_policy.h"
 #else
 #endif
 #include "ttf_font.h"
@@ -38,6 +39,11 @@
 #define UI_NAV_BACK_ICON_PX 48
 #define UI_NAV_BOLT_ICON_PX 26
 #define UI_NAV_NETWORK_ICON_PX 28
+/* 4G 图标是"文字 + 信号条"两行构图，同尺寸下比 wifi 线条看起来小一号，单独放大 4 px；
+ * 中心点与间距沿用 wifi 的排布，所以不会挤动邻居。
+ * The 4G mark stacks a wordmark over bars, so it reads a size smaller than the line icons;
+ * give it 4 extra px while keeping the same center pitch. */
+#define UI_NAV_CELL_ICON_PX 32
 #define UI_STATUS_TIME_PX 28
 #define UI_STATUS_PERCENT_PX 28
 #define UI_STATUS_SIGNATURE_PX 26
@@ -115,9 +121,21 @@ static const char *const labels[] = {"首页", "书架",
 #endif
     "文件管理", "设置"};
 static int s_power_signature=-1000;
+/* 4G 状态也参与刷新签名：图标要随着拨号/连上自己出现，不能等到下一次整页重绘。
+ * 0 = 不显示（开关关），1 = 拨号中，2 = 已连接。
+ * Cellular state feeds the refresh signature so the mark appears on its own instead of waiting
+ * for the next full repaint: 0 hidden, 1 dialing, 2 connected. */
+static unsigned status_cell_state(void) {
+#if KIIKO_BOARD_METALIO47
+    if (!cellular_available() || !app_settings_cellular_enabled()) return 0;
+    if (cellular_ready()) return 2;
+    if (cellular_connecting()) return 1;
+#endif
+    return 0;
+}
 static int power_signature(void) {
     const pmu_snapshot_t *pmu=read_pico_pmu_get();
-    return (pmu_battery_percent(pmu)+1)*2+(pmu_battery_charging(pmu)?1:0);
+    return ((pmu_battery_percent(pmu)+1)*2+(pmu_battery_charging(pmu)?1:0))*3+(int)status_cell_state();
 }
 
 EpdRect ui_nav_status_area(void) { return (EpdRect){0,12,UI_LOCK_WIDTH,56}; }
@@ -216,6 +234,11 @@ void ui_nav_status(uint8_t *fb) {
     read_pico_transfer_get_status(&network);
     const bool wifi_visible = network.network_ready && network.mode == READ_PICO_TRANSFER_MODE_STA;
     const bool bluetooth_visible = app_settings_ble_turner();
+    // 4G 开关关闭时不显示图标；开启时只要已连接或在拨号就显示，连接态用墨色、拨号态用浅灰。
+    // Hide the mark when the cellular switch is off; show it while connected or dialing, ink vs light gray.
+    const unsigned cell = status_cell_state();
+    const bool cell_visible = cell != 0;
+    const bool cell_ready = cell == 2;
     char percent[8] = "--%";
     int gauge_percent = pmu_battery_percent(pmu);
     if (gauge_percent >= 0) snprintf(percent, sizeof(percent), "%u%%", (unsigned)gauge_percent);
@@ -225,12 +248,19 @@ void ui_nav_status(uint8_t *fb) {
     const int network_right = percent_left - 10;
     const int wifi_center = network_right - UI_NAV_NETWORK_ICON_PX / 2;
     const int bluetooth_center = wifi_center - (wifi_visible ? UI_NAV_NETWORK_ICON_PX + 8 : 0);
+    // 4G 图标排在蓝牙/Wi-Fi 左侧；两者都不显示时占用 Wi-Fi 位。
+    // The cellular mark goes left of BT/Wi-Fi, or takes the Wi-Fi slot when neither is shown.
+    const int cell_center = (wifi_visible || bluetooth_visible)
+        ? (bluetooth_visible ? bluetooth_center : wifi_center) - (UI_NAV_NETWORK_ICON_PX + 8)
+        : wifi_center;
     int signature_width = 280;
     const int clock_right = 36 + status_number_width(clock);
     int available = 2 * (UI_LOCK_WIDTH / 2 - clock_right - 12);
     if (available < signature_width) signature_width = available > 0 ? available : 0;
     int group_left = percent_left;
-    if (wifi_visible || bluetooth_visible) {
+    if (cell_visible) {
+        group_left = cell_center - UI_NAV_CELL_ICON_PX / 2;
+    } else if (wifi_visible || bluetooth_visible) {
         group_left = (bluetooth_visible ? bluetooth_center : wifi_center) - UI_NAV_NETWORK_ICON_PX / 2;
     }
     available = 2 * (group_left - 12 - UI_LOCK_WIDTH / 2);
@@ -241,6 +271,9 @@ void ui_nav_status(uint8_t *fb) {
     if (signature[0]) ui_text_fixed_vc(fb, UI_LOCK_WIDTH / 2, status_center_y, UI_STATUS_SIGNATURE_PX,
                                       signature, EPD_DRAW_ALIGN_CENTER, false);
     if (wifi_visible) ui_nav_wifi_icon(fb, wifi_center, status_center_y, UI_NAV_NETWORK_ICON_PX, UI_GRAY_BLACK);
+    if (cell_visible)
+        ui_draw_icon(fb, cell_center, status_center_y, UI_NAV_CELL_ICON_PX,
+                     UI_ICON_SIGNAL_4G, cell_ready ? UI_GRAY_BLACK : UI_GRAY_LIGHT);
     if (bluetooth_visible)
         ui_draw_icon(fb, bluetooth_center, status_center_y, UI_NAV_NETWORK_ICON_PX,
                      UI_ICON_BLUETOOTH, UI_GRAY_BLACK);

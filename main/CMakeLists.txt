@@ -44,7 +44,12 @@ set(main_requires
     esp_http_client esp-tls
     mbedtls
     espressif__cjson
+    # 4G 蜂窝（EC718 Cat.1），经 iot_eth 虚拟以太网接入 lwIP。
+    # 4G cellular (EC718 Cat.1) riding iot_eth as a virtual Ethernet netif.
 )
+if(KIIKO_BOARD_METALIO47)
+    list(APPEND main_requires cellular_modem)
+endif()
 kiiko_board_sources(kiiko_selected_sources "${CMAKE_CURRENT_LIST_DIR}" "app_main.c"
         "boot_state.c"
         "apps/app_boot_recovery.c"
@@ -66,6 +71,8 @@ kiiko_board_sources(kiiko_selected_sources "${CMAKE_CURRENT_LIST_DIR}" "app_main
         "apps/app_onboarding.c"
         "factory_reset.c"
         "app/app_loop.c"
+        "app/cellular_policy.c"
+        "app/network_state.c"
         "app/sd_recovery.c"
         "app/crash_note.c"
         "app/app_registry.c"

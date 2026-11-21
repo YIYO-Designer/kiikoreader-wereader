@@ -113,7 +113,11 @@ CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
 
 CONFIG_LWIP_TCP_WND_DEFAULT=65535
 
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
+# 发送缓冲只影响"本机往外推"的速率，而 4G 下载慢的瓶颈在接收窗口/RTT，不在发。
+# 8 KB 足够发同步/登录那种小请求，省下的内部 DRAM 留给 Wi-Fi 驱动（这块板只有 55 KB）。
+# SND_BUF only sets how fast we push; the CAT.1 download limit is the receive window and RTT,
+# never the send side. 8 KB is plenty for the small sync/login bodies WeRead posts.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
 
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 

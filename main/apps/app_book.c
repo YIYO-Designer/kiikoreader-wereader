@@ -215,6 +215,7 @@ extern const app_desc_t app_device_settings;
 #include "esp_timer.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "read_pico_init.h"
@@ -523,13 +524,21 @@ typedef struct {
     atomic_bool cancel, done;
     ttf_font_prepared_t *prepared;
     esp_err_t error;
+    bool ext_stack;      /* 栈落在 PSRAM：任务要用 vTaskDeleteWithCaps 收尾 */
 } reader_font_job_t;
 static reader_font_job_t *s_font_job;
 static void reader_font_worker(void *arg) {
     reader_font_job_t *job = arg;
     job->prepared = ttf_font_prepare(job->path, &job->cancel, &job->error);
+    const bool ext_stack = job->ext_stack;
     atomic_store_explicit(&job->done, true, memory_order_release);
-    vTaskDelete(NULL);
+    /* 12 KB 栈在内部 DRAM 里已经申请不到——这块板内部堆只剩 55 KB，字体切换就是卡在这里。
+     * 栈改落 PSRAM 后可以照旧开 12 KB；EXT 栈的任务必须用 WithCaps 版本自删，否则不漏不报。
+     * A 12 KB stack no longer fits in internal DRAM (this board bottoms out near 55 KB), which is
+     * exactly why font switching failed. The stack now lives in PSRAM at the same size, and a task
+     * created with caps has to delete itself with the caps-aware call. */
+    if (ext_stack) vTaskDeleteWithCaps(NULL);
+    else vTaskDelete(NULL);
 }
 static void reader_font_reload_cancel(void) {
     reader_font_job_t *job = s_font_job;
@@ -7524,7 +7533,19 @@ static app_redraw_t select_reading_font_item(app_ctx_t* ctx, const ttf_font_item
     atomic_init(&job->cancel, false); atomic_init(&job->done, false);
     reader_font_choice_begin(item->path);
     s_font_job = job;
-    if (xTaskCreate(reader_font_worker, "reader_font", 12288, job, 1, NULL) != pdPASS) {
+    /* 先试 PSRAM 栈（内部 DRAM 只剩 55 KB，12 KB 栈申请不到就是"字体切换启动失败"），
+     * 再退化回内部栈——PSRAM 不可用或未使能 EXT 栈时才走这条。
+     * Try a PSRAM stack first (internal DRAM is down to ~55 KB, so a 12 KB stack is what failed),
+     * then fall back to internal for builds where EXT task stacks are unavailable. */
+    job->ext_stack = true;
+    BaseType_t made = xTaskCreateWithCaps(reader_font_worker, "reader_font", 12288, job, 1, NULL,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (made != pdPASS) {
+        job->ext_stack = false;
+        ESP_LOGW(TAG, "reader font worker: PSRAM stack unavailable, retrying internal");
+        made = xTaskCreate(reader_font_worker, "reader_font", 12288, job, 1, NULL);
+    }
+    if (made != pdPASS) {
         s_font_job = NULL; free(job); s_font_choice_pending = false;
         copy_text(s_reader_notice,sizeof(s_reader_notice),"字体切换启动失败，请重试");
         s_reader_notice_until=esp_timer_get_time()/1000+2200;

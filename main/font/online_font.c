@@ -5,6 +5,7 @@
  * Frozen: never stop another transfer session, bypass TLS, or apply a downloaded face.
  */
 #ifdef ESP_PLATFORM
+#include "app/network_state.h"
 #include "ui_locale_format.h"
 #endif
 #include "online_font.h"
@@ -82,7 +83,7 @@ static esp_http_client_handle_t open_source(const char *source){
         if(!url_allowed(url))break;
         next[0]=0;redirect_t redirect={.location=next};
         esp_http_client_config_t config={.url=url,.timeout_ms=4000,.buffer_size=2048,
-            .buffer_size_tx=1024,.crt_bundle_attach=esp_crt_bundle_attach,
+            .buffer_size_tx=1024,.addr_type=HTTP_ADDR_TYPE_INET,.crt_bundle_attach=esp_crt_bundle_attach,
             .disable_auto_redirect=true,.event_handler=header_event,.user_data=&redirect};
         client=esp_http_client_init(&config);if(!client)break;
         esp_http_client_set_header(client,"Accept-Encoding","identity");
@@ -123,7 +124,7 @@ done:
 }
 static esp_err_t ensure_network(bool *owned){
     read_pico_transfer_status_t status;read_pico_transfer_get_status(&status);
-    if(status.mode==READ_PICO_TRANSFER_MODE_STA&&status.network_ready&&status.state!=READ_PICO_TRANSFER_UPLOADING)return ESP_OK;
+    if(app_network_ready()&&status.state!=READ_PICO_TRANSFER_UPLOADING)return ESP_OK;
     if(status.state!=READ_PICO_TRANSFER_STOPPED)return ESP_ERR_INVALID_STATE;
     char name[33];bool saved=false;
     if(read_pico_transfer_get_saved_wifi(name,&saved)!=ESP_OK||!saved)return ESP_ERR_NOT_FOUND;
@@ -134,7 +135,7 @@ static esp_err_t ensure_network(bool *owned){
     int64_t limit=esp_timer_get_time()+30000000;
     while(!cancelled(NULL)&&esp_timer_get_time()<limit){
         read_pico_transfer_service_poll();read_pico_transfer_get_status(&status);
-        if(status.network_ready)return ESP_OK;
+        if(app_network_ready())return ESP_OK;
         if(status.state==READ_PICO_TRANSFER_ERROR)break;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -159,8 +160,8 @@ static void worker(void *arg){
     // Borrow a BLE lease for font transfer; restore the original user preference on completion.
     result=ble_pt_network_acquire();if(result!=ESP_OK){message="蓝牙正在忙，请稍后重试";goto done;}ble_lease=true;
     result=ensure_network(&owned);
-    if(result!=ESP_OK){message=result==ESP_ERR_NOT_FOUND?"请先在WiFi设置中连接网络":"WiFi连接失败，请重试";goto done;}
-    if(time(NULL)<1704067200){message="请先完成WiFi对时";result=ESP_ERR_INVALID_STATE;goto done;}
+    if(result!=ESP_OK){message=app_network_offline_text();goto done;}
+    if(time(NULL)<1704067200){message="请先联网校准时间";result=ESP_ERR_INVALID_STATE;goto done;}
     if(cancelled(NULL)){result=ESP_ERR_INVALID_STATE;goto done;}
     buffer=heap_caps_malloc(8192,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     if(!buffer){message="内存不足，请稍后重试";result=ESP_ERR_NO_MEM;goto done;}
@@ -212,7 +213,7 @@ esp_err_t online_font_start(unsigned index){
     atomic_store(&s_cancel,false);
     portENTER_CRITICAL(&s_lock);uint32_t revision=s_status.revision+1;
     s_status=(online_font_status_t){.phase=ONLINE_FONT_CONNECTING,.item=index,.total=item->source_size,.revision=revision,.busy=true};
-    snprintf(s_status.message,sizeof(s_status.message),"正在连接WiFi");portEXIT_CRITICAL(&s_lock);
+    snprintf(s_status.message,sizeof(s_status.message),"%s",app_network_wait_text());portEXIT_CRITICAL(&s_lock);
     if(xTaskCreate(worker,"font_online",8192,(void *)(uintptr_t)index,3,NULL)!=pdPASS){
         state(ONLINE_FONT_FAILED,"内存不足，请稍后重试");
         portENTER_CRITICAL(&s_lock);s_status.busy=false;portEXIT_CRITICAL(&s_lock);

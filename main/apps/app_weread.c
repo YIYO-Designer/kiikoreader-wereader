@@ -1,3 +1,4 @@
+#include "app/network_state.h"
 #include "app_weread.h"
 
 #include <stdio.h>
@@ -9,6 +10,8 @@
 #include "app_transfer_mode.h"
 #include "book_cover.h"
 #include "book_store.h"
+#include "cellular_policy.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -23,7 +26,12 @@
 
 extern const app_desc_t app_book, app_transfer;
 
-typedef enum { SHELF, ACCOUNT, ACTIONS, LOGOUT, ASK_WIFI, WORK, CONFIRM_DEL } wr_view_t;
+typedef enum { SHELF, ACCOUNT, ACTIONS, LOGOUT, ASK_WIFI, WORK, CONFIRM_DEL, WAIT_NET } wr_view_t;
+/* 4G 等待开始时刻：超过 45 秒还没拿到 IP 就退回提示卡片，让读者有机会改连 Wi-Fi 或取消。
+ * Start of the 4G wait: after 45 s without an IP, fall back to a prompt so the reader can
+ * switch to Wi-Fi or cancel instead of staring at a card forever. */
+#define WR_NET_WAIT_TIMEOUT_MS 45000
+static int64_t s_net_wait_ms;
 #define WR_TAG "WEREAD"
 /* 书架槽位由样式决定：网格 9、列表 8。数组按上限开，用前先夹紧，改样式不会越界。 */
 #define WR_SLOTS 9
@@ -51,7 +59,16 @@ static bool s_check_pending;
 static int64_t s_session_verified_us;
 static int s_page, s_count;
 static unsigned s_selected_index;
-static wr_book_t s_books[WR_SLOTS], s_selected;
+/*
+ * 书架九本的完整记录（书名/作者/封面地址）常驻 6.2 KB 内部 DRAM，而这台机器的内部堆只剩
+ * 55 KB 左右——Wi-Fi 驱动初始化最少要 63 KB，扫描邻居网络就是被这 8 KB 卡住的。书架数据只在
+ * 绘制书架和点开图书时读，放 PSRAM 完全够快，把内部 RAM 让给射频。
+ * The nine shelf records (title/author/cover URL) hold 6.2 KB of internal DRAM permanently, while
+ * this board's internal heap bottoms out near 55 KB — the Wi-Fi driver needs at least 63 KB to come
+ * up, and that 8 KB gap is exactly what broke neighbour scanning. Shelf data is only read while
+ * painting the shelf and opening a book, so PSRAM is plenty fast; internal RAM goes to the radio.
+ */
+EXT_RAM_BSS_ATTR static wr_book_t s_books[WR_SLOTS], s_selected;
 /*
  * 书架的缓存状态不再只有"有/没有"两档：分章缓存的书可能只下了一部分。
  * 逐本逐章 stat 太重，所以读后台维护的概况文件（已就绪章数 / 全书章数）。
@@ -111,6 +128,31 @@ static void connect_wifi(app_ctx_t *ctx) {
     ctx->request_app = &app_transfer;
 }
 
+/*
+ * 网络优先级（用户 2026-11-21）：4G 开启时优先用 4G，不提示也不跳转去开 Wi-Fi；
+ * 只有 4G 关闭时才回到原来"提示并跳转连 Wi-Fi"的流程。Wi-Fi 已经连上时 wr_online()
+ * 本就为真，不会走到这里——策略任务也会在 Wi-Fi 在线时自动断开 4G，天然 Wi-Fi 优先。
+ * Network priority (2026-11-21): when the 4G switch is on, wait for the cellular link
+ * instead of prompting/jumping to Wi-Fi setup. Only when cellular is off do we fall back
+ * to the original Wi-Fi prompt. If Wi-Fi is already up, wr_online() is true and we never
+ * reach here; the policy also tears down 4G while Wi-Fi is up, so Wi-Fi naturally wins.
+ */
+static bool cellular_preferred(void) {
+#if KIIKO_BOARD_METALIO47
+    return app_network_cellular_enabled();
+#else
+    return false;
+#endif
+}
+
+/* 进入"等 4G 链路就绪"卡片，记住起始时刻供超时兜底。 */
+static app_redraw_t show_wait_net(app_ctx_t *ctx) {
+    (void)ctx;
+    s_net_wait_ms = esp_timer_get_time() / 1000;
+    s_view = WAIT_NET;
+    return APP_REDRAW_PAGE;
+}
+
 static void open_book(app_ctx_t *ctx, bool offline) {
     if (offline) snprintf(s_offline, sizeof(s_offline), "%s", s_open);
     if (s_from_home ? app_book_request_open_from_home(s_open) : app_book_request_open(s_open)) {
@@ -135,6 +177,9 @@ bool app_weread_take_return(void) {
 
 bool app_weread_confirm_open(app_ctx_t *ctx, const char *path, bool from_home) {
     wr_book_t book;
+    // 4G 优先时不拦书：链路就绪后后台自动补报阅读时长，读者照常离线开书。
+    // With 4G preferred, do not intercept: reporting resumes in the background once online.
+    if (cellular_preferred()) return false;
     if (wr_online() || !wr_reporting_book(path, &book)) return false;
     snprintf(s_open, sizeof(s_open), "%s", path);
     s_from_home = from_home;
@@ -157,6 +202,9 @@ static app_redraw_t start(app_ctx_t *ctx, wr_job_t job) {
     if (!wr_online()) {
         s_wait_wifi = true;
         s_after_wifi = job;
+        // 4G 优先：后台策略正在拨号，留在页内等链路就绪后自动续做本任务，不跳转 Wi-Fi 设置。
+        // 4G preferred: the policy task is dialing; stay here and resume this job once online.
+        if (cellular_preferred()) return show_wait_net(ctx);
         connect_wifi(ctx);
         return APP_REDRAW_NONE;
     }
@@ -190,7 +238,7 @@ static void enter(app_ctx_t *ctx) {
     } else if (s_wait_wifi) {
         s_wait_wifi = false;
         if (wr_online()) (void)start(ctx,s_after_wifi);
-        else s_message = "Wi-Fi 未连接";
+        else s_message = app_network_offline_text();
     } else if (s_logged && !session_verified_recently()) {
         s_check_pending = true;
         if (wr_online() && wr_status(NULL,0,NULL,NULL) != WR_BUSY) {
@@ -452,6 +500,17 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
             button(fb,action_rect(2),"取消",true);
         }
     }
+    if (s_view == WAIT_NET) {
+        /* 等 4G 的卡片：说明为什么停在这里，并且只留一个出口，不让读者以为页面卡死。
+         * The 4G wait card says why the page is holding and gives one way out. */
+        EpdRect box = {58,268,568,657};
+        ui_fill_round_rect(fb,box,20,UI_GRAY_WHITE);
+        ui_draw_control_frame(fb,box,20,0x50);
+        ui_text_box(fb,(EpdRect){83,298,518,75},32,app_network_wait_text(),EPD_DRAW_ALIGN_CENTER,false);
+        text_block(fb,(EpdRect){83,344,518,84},26,
+                   "这本书还没缓存到本地，需要联网才能取到目录。");
+        button(fb,action_rect(0),"取消",true);
+    }
     if (s_view == WORK) {
         title(fb,"微信读书");
         static const char *const labels[] = {"请用微信扫码登录","正在同步书架与封面","正在缓存图文","正在上传本地进度","正在获取云端进度","正在上报阅读时长","正在验证登录状态"};
@@ -494,6 +553,27 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
 static app_redraw_t open_selected(app_ctx_t *ctx);
 
 static app_redraw_t tick(app_ctx_t *ctx) {
+    if (s_view == WAIT_NET) {
+        if (wr_online()) {
+            // 链路就绪：把刚才被打断的任务（或那次打开）续上，读者不必再点一次。
+            // Link is up: resume the interrupted job or open, so nothing has to be tapped twice.
+            if (s_wait_wifi) { s_wait_wifi = false; return start(ctx, s_after_wifi); }
+            if (s_open_after_wifi) {
+                s_open_after_wifi = false; s_ask_connect = false; s_view = ACTIONS;
+                return open_selected(ctx);
+            }
+            s_view = SHELF;
+            return APP_REDRAW_PAGE;
+        }
+        if (!app_network_cellular_enabled() || ctx->now_ms - s_net_wait_ms > WR_NET_WAIT_TIMEOUT_MS) {
+            /* 45 秒还拿不到 IP：退回"先连 Wi-Fi？"卡片，读者可以改走 Wi-Fi 或取消。
+             * 45 s without an IP: fall back to the Wi-Fi prompt so the reader can switch or cancel. */
+            s_view = ASK_WIFI;
+            s_ask_connect = true;
+            return APP_REDRAW_PAGE;
+        }
+        return APP_REDRAW_NONE;
+    }
     if (s_ask_connect && s_wifi_open && s_view == ASK_WIFI && !wr_online() &&
         ctx->now_ms - s_wifi_wait_ms > 20000) {
         s_wifi_open = false;
@@ -627,6 +707,10 @@ static app_redraw_t open_selected(app_ctx_t *ctx) {
      * failed" while the real cause was no network. Books already on the shelf with a cached TOC
      * still open offline — those are readable.
      */
+    if (!wr_online() && !wr_book_path(&s_selected, s_open) && cellular_preferred()) {
+        s_wait_wifi = false;
+        return show_wait_net(ctx);
+    }
     if (!wr_online() && !wr_book_path(&s_selected, s_open)) {
         s_wait_wifi = false; s_ask_connect = true; s_view = ASK_WIFI;
         return APP_REDRAW_PAGE;
@@ -645,7 +729,7 @@ static app_redraw_t open_selected(app_ctx_t *ctx) {
     wr_prefetch_nudge(start_chapter);
     s_from_home = false;
     s_back_to_weread = true;
-    if (s_logged && !wr_online()) { s_view = ASK_WIFI; return APP_REDRAW_PAGE; }
+    if (s_logged && !wr_online() && !cellular_preferred()) { s_view = ASK_WIFI; return APP_REDRAW_PAGE; }
     open_book(ctx, false);
     return APP_REDRAW_NONE;
 }
@@ -703,6 +787,10 @@ static app_redraw_t activate(app_ctx_t *ctx,int index) {
         s_view = SHELF;
         return APP_REDRAW_PAGE;
     }
+    if (s_view == WAIT_NET) {
+        s_wait_wifi = false; s_open_after_wifi = false; s_view = SHELF;
+        return APP_REDRAW_PAGE;
+    }
     if (s_view == ASK_WIFI && s_ask_connect) {
         if (index == 0) {
             s_wifi_open = true; s_open_after_wifi = true; s_wifi_wait_ms = ctx->now_ms;
@@ -751,6 +839,11 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *event) {
     }
     if (s_view == WORK) {
         if (ui_rect_hit(action_rect(4),x,y)) { wr_cancel(); s_message="正在取消"; return APP_REDRAW_PAGE; }
+        return APP_REDRAW_NONE;
+    }
+    if (s_view == WAIT_NET) {
+        if (ui_rect_hit(action_rect(0),x,y) || ui_rect_hit((EpdRect){58,268,568,657},x,y))
+            return activate(ctx,0);
         return APP_REDRAW_NONE;
     }
     if (s_view == ACTIONS || s_view == ASK_WIFI || s_view == LOGOUT || s_view == CONFIRM_DEL) {
@@ -805,6 +898,7 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *event) {
 static bool root(app_ctx_t *ctx) { (void)ctx; return s_view==SHELF; }
 static bool navigation(app_ctx_t *ctx) { (void)ctx; return s_view==SHELF || s_view==ACCOUNT; }
 static app_redraw_t back(app_ctx_t *ctx) {
+    if (s_view==WAIT_NET) return activate(ctx,0);
     if (s_view==ASK_WIFI || s_view==LOGOUT) return activate(ctx,2);
     if (s_view==WORK) { wr_cancel(); return APP_REDRAW_NONE; }
     if (s_view==SHELF) { ui_nav_request(ctx,UI_TAB_HOME); return APP_REDRAW_NONE; }

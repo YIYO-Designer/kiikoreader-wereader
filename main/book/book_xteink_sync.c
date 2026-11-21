@@ -14,6 +14,7 @@
  *      reach the shelf; TLS and integrity checks are never silently disabled.
  */
 
+#include "app/network_state.h"
 #include "book_xteink_sync.h"
 // 网络/页面控制按体积编译，保留Pico原4MiB应用槽；协议、校验与任务时序不变。
 // Size-optimize IO/page control to retain Pico's4MiB slots without changing protocol,verification or task timing.
@@ -35,6 +36,7 @@
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -101,7 +103,10 @@ static uint32_t s_bind_utc;
 static int64_t s_bind_clock_us;
 static atomic_uint s_import_count;
 static xteink_sync_status_t s_status = {.state = XTEINK_SYNC_IDLE};
-static xteink_state_t s_state;
+/* 身份令牌常驻 1.5 KB，只在绑定/拉列表时读；内部 DRAM 要留给 Wi-Fi 驱动（见 app_weread.c）。
+ * The 1.5 KB identity/token blob is read only while binding or listing tasks, so it lives in PSRAM
+ * and leaves internal DRAM for the Wi-Fi driver. */
+EXT_RAM_BSS_ATTR static xteink_state_t s_state;
 static bool s_state_loaded;
 static char s_http_error[96];
 static char s_download_error[96];
@@ -378,6 +383,8 @@ static bool http_request(const char* url, bool post, const char* body, const cha
     esp_http_client_config_t config = {
         .url = url,
         .timeout_ms = XTEINK_HTTP_TIMEOUT_MS,
+        /* 4G NAT 网口无 IPv6 路由：强制 IPv4，与下载/封面路径一致。 */
+        .addr_type = HTTP_ADDR_TYPE_INET,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .buffer_size = 4096,
         .buffer_size_tx = 2048,
@@ -482,12 +489,12 @@ static cJSON* json_find(cJSON* node, const char* key) {
 static bool ensure_network(void) {
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
-    if (status.network_ready) return true;
+    if (app_network_ready()) return true;
     char ssid[33];
     bool configured = false;
     read_pico_transfer_get_saved_wifi(ssid, &configured);
     if (!configured) {
-        publish(XTEINK_SYNC_FAILED, "请先连接 WiFi（设置→网络）");
+        publish(XTEINK_SYNC_FAILED, app_network_offline_text());
         return false;
     }
     if (status.state != READ_PICO_TRANSFER_STOPPED) read_pico_transfer_stop();
@@ -500,7 +507,7 @@ static bool ensure_network(void) {
     for (int i = 0; i < 300 && !s_cancel; ++i) {
         read_pico_transfer_service_poll();
         read_pico_transfer_get_status(&status);
-        if (status.network_ready) return true;
+        if (app_network_ready()) return true;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     publish(s_cancel ? XTEINK_SYNC_CANCELLED : XTEINK_SYNC_FAILED,

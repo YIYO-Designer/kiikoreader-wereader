@@ -32,8 +32,14 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = ROOT / "tools/icons/lucide"
 ANIMATE_DIR = ROOT / "tools/icons/animateicons"
+# 中文：本仓自绘的图标（非上游 vendor），同样只放描边路径。
+# English: icons drawn in-house rather than vendored upstream; stroke paths only.
+CUSTOM_DIR = ROOT / "tools/icons/custom"
 
 def icon_source(name: str) -> Path:
+    custom = CUSTOM_DIR / f"{name}.svg"
+    if custom.exists():
+        return custom
     return (ANIMATE_DIR if name.startswith(("pager-", "animate-")) else SOURCE_DIR) / f"{name}.svg"
 view_marker = ROOT / '.kiiko-source-view.json'
 DEFAULT_BOARD = os.environ.get('KIIKO_BOARD') or (json.loads(view_marker.read_text())['board'] if view_marker.exists() else 'pico')
@@ -98,6 +104,8 @@ COMMON_ICONS = (
     "animate-bookmark-plus", # 阅读题头已收藏 / saved reader-header favorite
     "x",                 # 电源弹窗·取消 / power dialog, cancel
     "hard-drive", "file-image", "usb", "folder-input", "trash", "layout-grid", "search", "expand", "book", "book-bookmark", "palette", # 文件管理 / file hub
+    "signal-4g",         # 4G 网络：设置行、状态栏 / cellular data: settings row, status bar
+    "sim-card",          # SIM 卡槽选择行 / SIM slot row
 )
 
 def icons_for_board(board):
@@ -561,7 +569,8 @@ def emit_header(masks: dict[str, list[int]]) -> None:
         "typedef enum {",
     ]
     for name in masks:
-        origin = "animateicons" if name.startswith(("pager-", "animate-")) else "lucide"
+        origin = ("animateicons" if name.startswith(("pager-", "animate-"))
+                  else "custom" if icon_source(name).parent == CUSTOM_DIR else "lucide")
         lines.append(f"    UI_ICON_{name.replace('-', '_').upper()},  // {origin}/{name}")
     lines += [
         "    UI_ICON_COUNT,",

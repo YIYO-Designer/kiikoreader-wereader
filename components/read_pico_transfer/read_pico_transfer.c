@@ -20,6 +20,16 @@
 #endif
 #include "read_pico_search.h"
 #include <stdbool.h>
+#include <stdatomic.h>
+typedef bool (*external_network_ready_fn)(void);
+static _Atomic(external_network_ready_fn) s_external_network_ready;
+void read_pico_transfer_set_external_network_ready(bool (*ready)(void)) {
+    atomic_store(&s_external_network_ready, ready);
+}
+static bool transfer_external_network_ready(void) {
+    external_network_ready_fn ready = atomic_load(&s_external_network_ready);
+    return ready && ready();
+}
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -894,6 +904,7 @@ static esp_err_t sync_time_impl(uint32_t *utc_seconds) {
     *utc_seconds = 0;
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
+    if (transfer_external_network_ready()) return sync_time_online_impl(utc_seconds);
     transfer_time_route_t route = time_route(s_wifi,
         status.mode == READ_PICO_TRANSFER_MODE_STA, status.network_ready,
         !s_http && !s_netif && status.state == READ_PICO_TRANSFER_STOPPED);
@@ -997,9 +1008,10 @@ time_cleanup:
 static esp_err_t sync_time_online_impl(uint32_t *utc_seconds) {
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
-    if (!s_wifi || status.mode != READ_PICO_TRANSFER_MODE_STA || !status.network_ready ||
+    if ((!transfer_external_network_ready() &&
+         (!s_wifi || status.mode != READ_PICO_TRANSFER_MODE_STA || !status.network_ready)) ||
         status.state == READ_PICO_TRANSFER_UPLOADING) return ESP_ERR_INVALID_STATE;
-    time_network_log(s_netif);
+    time_network_log(transfer_external_network_ready() ? esp_netif_get_default_netif() : s_netif);
     return sync_network_time(utc_seconds);
 }
 
@@ -2783,6 +2795,7 @@ static esp_err_t sync_time_impl(uint32_t *utc_seconds) {
     *utc_seconds = 0;
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
+    if (transfer_external_network_ready()) return sync_time_online_impl(utc_seconds);
     transfer_time_route_t route = time_route(s_wifi,
         status.mode == READ_PICO_TRANSFER_MODE_STA, status.network_ready,
         !s_http && !s_netif && status.state == READ_PICO_TRANSFER_STOPPED);
@@ -2858,7 +2871,8 @@ time_cleanup:
 static esp_err_t sync_time_online_impl(uint32_t *utc_seconds) {
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
-    if (!s_wifi || status.mode != READ_PICO_TRANSFER_MODE_STA || !status.network_ready ||
+    if ((!transfer_external_network_ready() &&
+         (!s_wifi || status.mode != READ_PICO_TRANSFER_MODE_STA || !status.network_ready)) ||
         status.state == READ_PICO_TRANSFER_UPLOADING) return ESP_ERR_INVALID_STATE;
     return time_sync_ntp(utc_seconds);
 }

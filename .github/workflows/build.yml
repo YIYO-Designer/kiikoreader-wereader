@@ -2,11 +2,24 @@ name: build
 
 on:
   push:
-    branches: [main, codex/metalio-s31-test30]
+    branches: [main, codex/metalio-s31-test30, codex/unified-s31-network]
   pull_request:
   workflow_dispatch:
 
 jobs:
+  unified-network-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unified S31 network and capability regressions
+        run: |
+          python3 tools/unified_network_host_test.py
+          python3 tools/board_layer_host_test.py
+          python3 tools/board_selection_host_test.py
+          python3 tools/metalio_font_staging_host_test.py
+          python3 tools/metalio_font_recovery_host_test.py
+          python3 tools/time_service_host_test.py
+
   display-host-tests:
     env:
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1

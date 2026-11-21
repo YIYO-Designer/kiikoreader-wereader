@@ -58,6 +58,7 @@
 #include "app_registry.h"
 #include "app_transfer_mode.h"
 #include "settings.h"
+#include "cellular_policy.h"
 #include "factory_reset.h"
 #include "book_cover_jobs.h"
 #if KIIKO_BOARD_METALIO47
@@ -446,7 +447,23 @@ static int settings_main_row_height(void) {
     return 82;
 }
 #define SETTINGS_ROW_H settings_main_row_height()
-#define SETTINGS_WIRELESS_ROWS 3
+typedef enum {
+    CONNECTION_WIFI, CONNECTION_CELLULAR, CONNECTION_SIM,
+    CONNECTION_BLUETOOTH, CONNECTION_TIME
+} connection_item_t;
+static bool s_main_cellular;
+static int settings_connection_count(void) { return s_main_cellular ? 5 : 3; }
+static connection_item_t settings_connection_item(int row) {
+    static const connection_item_t wifi_items[] = {
+        CONNECTION_WIFI, CONNECTION_BLUETOOTH, CONNECTION_TIME
+    };
+    static const connection_item_t cellular_items[] = {
+        CONNECTION_WIFI, CONNECTION_CELLULAR, CONNECTION_SIM,
+        CONNECTION_BLUETOOTH, CONNECTION_TIME
+    };
+    return s_main_cellular ? cellular_items[row] : wifi_items[row];
+}
+#define SETTINGS_WIRELESS_ROWS settings_connection_count()
 #if KIIKO_BOARD_METALIO47
 #define SETTINGS_DISPLAY_ROWS 9
 #else
@@ -937,6 +954,8 @@ static void setting_icon(uint8_t *fb, int index, int cx, int cy) {
         UI_ICON_LOCK,              // 18 双击解锁 / double-press unlock
         UI_ICON_ZAP,               // 19 快充 / fast charge
         [20] = UI_ICON_CHART_COLUMN, // 20 书籍百分比 / cover progress
+        [22] = UI_ICON_SIGNAL_4G,   // 22 4G 网络 / cellular data
+        [23] = UI_ICON_SIM_CARD,    // 23 SIM 卡槽 / SIM slot
     };
     if (index < 0 || index >= (int)(sizeof(icons) / sizeof(icons[0]))) return;
     ui_draw_icon(fb, cx, cy, SETTINGS_ICON_PX, icons[index], SETTINGS_ICON_INK);
@@ -963,6 +982,19 @@ static void settings_switch(uint8_t *fb, int center_y, bool active) {
     epd_fill_circle(cx, track.y + 19, 16, UI_GRAY_WHITE, fb);
     epd_draw_circle(cx, track.y + 19, 16, 0x30, fb);
 }
+
+#if KIIKO_BOARD_METALIO47
+/* SIM 卡槽三档：自动（卡托优先，拔掉就退回内置）、只用卡托、只用内置。
+ * 卡托能插普通手机卡，内置是焊死的物联网卡，两张卡的上网出口并不一样。
+ * Three states: auto (tray first, fall back when it is pulled), tray only, internal only. */
+static const char *sim_slot_label(app_sim_slot_t slot) {
+    switch (slot) {
+        case APP_SIM_TRAY: return "卡托卡";
+        case APP_SIM_INTERNAL: return "内置卡";
+        default: return "自动";
+    }
+}
+#endif
 
 static void setting_group(uint8_t *fb, int title_y, const char *title,
                           int card_y, const int icons[], const char *const labels[],
@@ -1765,9 +1797,29 @@ static void render_content(app_ctx_t *ctx, uint8_t *fb) {
         ui_draw_icon(fb,625,profile_y+profile_h/2,26,UI_ICON_CHEVRON_RIGHT,UI_GRAY_BLACK);
     }
     char wifi[56];snprintf(wifi,sizeof(wifi),"%s",s_main_wifi_saved?s_main_wifi:"未配置");
-    const char *connection_labels[]={"WiFi","蓝牙翻页器","日期与时间"};
-    const char *connection_values[]={wifi,app_settings_ble_turner()?"已开启":"已关闭","设置"};
-    const int connection_icons[]={0,1,6};
+    const char *connection_labels[5], *connection_values[5];
+    int connection_icons[5];
+    for (int row=0; row<SETTINGS_WIRELESS_ROWS; ++row) {
+        switch (settings_connection_item(row)) {
+            case CONNECTION_WIFI:
+                connection_labels[row]="WiFi";connection_values[row]=wifi;connection_icons[row]=0;break;
+#if KIIKO_BOARD_METALIO47
+            case CONNECTION_CELLULAR:
+                connection_labels[row]="4G 网络";
+                connection_values[row]=app_settings_cellular_enabled()?"开启":"关闭";
+                connection_icons[row]=22;break;
+            case CONNECTION_SIM:
+                connection_labels[row]="SIM 卡";connection_values[row]=sim_slot_label(app_settings_sim_slot());
+                connection_icons[row]=23;break;
+#endif
+            case CONNECTION_BLUETOOTH:
+                connection_labels[row]="蓝牙翻页器";
+                connection_values[row]=app_settings_ble_turner()?"已开启":"已关闭";
+                connection_icons[row]=1;break;
+            default:
+                connection_labels[row]="日期与时间";connection_values[row]="设置";connection_icons[row]=6;break;
+        }
+    }
     setting_group(fb,SETTINGS_WIRELESS_Y-49,"连接与时间",SETTINGS_WIRELESS_Y,
                   connection_icons,connection_labels,connection_values,SETTINGS_WIRELESS_ROWS);
     char font_name[96],contrast[24],idle[24],signature[96];
@@ -2230,6 +2282,7 @@ static void on_enter(app_ctx_t *ctx) {
     s_page = SETTINGS_MAIN;
     s_shelf_style_from_manage=s_shelf_style_requested;s_shelf_style_requested=false;
     if(s_shelf_style_from_manage)s_page=SETTINGS_SHELF_STYLE;
+    s_main_cellular = cellular_available();
     s_style_scroll = s_main_scroll = s_font_page = s_wallpaper_page = 0;
     s_collage_prepare_pending = false;
     s_scroll_drag_consumed = s_scroll_present_pending = false;
@@ -2300,6 +2353,18 @@ static app_redraw_t reset_tick(void) {
 }
 
 static app_redraw_t on_tick(app_ctx_t *ctx) {
+    // Keep draw/hit-test/scroll geometry on the same capability snapshot.
+    // Switch only between gestures, then repaint before accepting a new tap.
+    if (s_page==SETTINGS_MAIN && s_main_cellular!=cellular_available()
+#if KIIKO_BOARD_METALIO47
+        && !s_list_drag.tracking && !s_list_drag.settle_pending
+#endif
+    ) {
+        s_main_cellular=cellular_available();
+        s_main_scroll=0;
+        s_scroll_present_pending=false;
+        return APP_REDRAW_PAGE;
+    }
 #if KIIKO_BOARD_METALIO47
     if(s_list_drag.tracking||s_list_drag.settle_pending) {
         app_redraw_t redraw=settings_drag_tick(ctx);
@@ -3211,10 +3276,24 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
     int row;
     if (y>=SETTINGS_WIRELESS_Y && y<SETTINGS_WIRELESS_Y+SETTINGS_WIRELESS_ROWS*SETTINGS_ROW_H) {
         row=(y-SETTINGS_WIRELESS_Y)/SETTINGS_ROW_H;
-        if(row==0) {
+        const connection_item_t item=settings_connection_item(row);
+        if(item==CONNECTION_WIFI) {
             extern const app_desc_t app_transfer;app_transfer_request_wifi_setup();ctx->request_app=&app_transfer;return APP_REDRAW_NONE;
         }
-        if(row==1) {
+#if KIIKO_BOARD_METALIO47
+        if(item==CONNECTION_CELLULAR) {
+            app_settings_set_cellular_enabled(!app_settings_cellular_enabled());
+            cellular_policy_request_restart();
+            return APP_REDRAW_PAGE;
+        }
+        if(item==CONNECTION_SIM) {
+            app_sim_slot_t next=(app_sim_slot_t)(((int)app_settings_sim_slot()+1)%3);
+            app_settings_set_sim_slot(next);
+            cellular_policy_request_restart();
+            return APP_REDRAW_PAGE;
+        }
+#endif
+        if(item==CONNECTION_BLUETOOTH) {
             s_page=SETTINGS_BLUETOOTH;s_ble_scroll=s_ble_learning=0;s_ble_notice[0]=s_ble_feedback[0]=0;
             ble_pt_raw_t unused;while(ble_pt_pop_raw(&unused)){}return APP_REDRAW_PAGE;
         }

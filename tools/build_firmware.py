@@ -227,7 +227,7 @@ def build_one(board, args):
         except ValueError:
             jobs = None
     if jobs:
-        command[2:2] = ['-j', str(jobs)]
+        command.remove('build')
     if board=='metalio47':
         for index,value in enumerate(command):
             if value.startswith('-DSDKCONFIG_DEFAULTS='):
@@ -271,7 +271,7 @@ def build_one(board, args):
                   'CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM':'4','CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP':'y',
                   'CONFIG_ESP_WIFI_IRAM_OPT':'y','CONFIG_ESP_WIFI_RX_IRAM_OPT':'y','CONFIG_ESP_WIFI_SLP_IRAM_OPT':'y',
                   'CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL':'16','CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF':'5',
-                  'CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS':'48','CONFIG_LWIP_TCP_SACK_OUT':'y','CONFIG_LWIP_TCP_SND_BUF_DEFAULT':'5760',
+                  'CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS':'48','CONFIG_LWIP_TCP_SACK_OUT':'y','CONFIG_LWIP_TCP_SND_BUF_DEFAULT':'8192',
                   'CONFIG_LWIP_TCPIP_RECVMBOX_SIZE':'64','CONFIG_LWIP_TCP_MSS':'1440',
                   'CONFIG_ESP_WIFI_AMPDU_TX_ENABLED':'y','CONFIG_ESP_WIFI_AMPDU_RX_ENABLED':'y',
                   'CONFIG_ESP_WIFI_TX_BA_WIN':'64','CONFIG_LWIP_SO_RCVBUF':'y'}
@@ -282,6 +282,7 @@ def build_one(board, args):
     if cache:
         shutil.copytree(cache, source / 'managed_components', dirs_exist_ok=True)
     env = dict(os.environ)
+    env.pop('MSYSTEM', None)
     env.update(IDF_PATH=str(sdk), IDF_TARGET=info['idf_target'], KIIKO_BOARD=board,
                KIIKO_PROJECT_VER=info['version'], IDF_PYTHON_ENV_PATH=str(python.parent.parent),
                IDF_PYTHON_CHECK_CONSTRAINTS='no', IDF_SKIP_CHECK_SUBMODULES='1',
@@ -298,6 +299,9 @@ def build_one(board, args):
     env['PATH'] = os.pathsep.join(extra + [env.get('PATH', '')])
     with (work / 'build.log').open('w', encoding='utf-8', errors='replace') as log:
         result = subprocess.run(command, cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT)
+        if result.returncode == 0 and jobs:
+            result = subprocess.run(['ninja', '-C', str(build), '-j', str(jobs)],
+                                    cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT)
     if result.returncode:
         print((work / 'build.log').read_text(errors='replace')[-8000:])
         raise RuntimeError(f'{board} build failed; see {work / "build.log"}')

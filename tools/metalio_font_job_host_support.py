@@ -6,17 +6,26 @@ FIXTURE=r'''
 #include <stdlib.h>
 #include <stdatomic.h>
 #define pdPASS 1
+typedef int BaseType_t;
+#ifndef ESP_LOGW
+#define ESP_LOGW(...) ((void)0)
+#endif
 #ifndef ESP_ERR_INVALID_STATE
 #define ESP_ERR_INVALID_STATE 0x103
 #endif
 typedef struct {char path[160];}ttf_font_prepared_t;
-typedef struct {char path[160];atomic_bool cancel,done;ttf_font_prepared_t *prepared;esp_err_t error;}reader_font_job_t;
+typedef struct {char path[160];atomic_bool cancel,done;ttf_font_prepared_t *prepared;esp_err_t error;bool ext_stack;}reader_font_job_t;
 static reader_font_job_t *s_font_job;
 static void (*queued_worker)(void *);static void *queued_arg;
 static bool create_fails;
 static unsigned retired;
 static int xTaskCreate(void(*fn)(void*),const char*name,unsigned stack,void*arg,int priority,void*handle){
  (void)name;(void)stack;(void)priority;(void)handle;if(create_fails)return 0;assert(!queued_worker);queued_worker=fn;queued_arg=arg;return pdPASS;}
+#define MALLOC_CAP_SPIRAM 1
+#define MALLOC_CAP_8BIT 2
+static int xTaskCreateWithCaps(void(*fn)(void*),const char*name,unsigned stack,void*arg,int priority,void*handle,unsigned caps){
+ assert(caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));return xTaskCreate(fn,name,stack,arg,priority,handle);}
+static void vTaskDeleteWithCaps(void*p){assert(!p);}
 static void run_worker(void){if(queued_worker){void(*fn)(void*)=queued_worker;void*arg=queued_arg;queued_worker=NULL;fn(arg);}}
 static void vTaskDelete(void*p){assert(!p);}
 static void vTaskDelay(int n){assert(n==1);run_worker();}

@@ -37,6 +37,8 @@
 
 本仓库专注固件源码与构建说明。网站、在线刷机页面、历史固件镜像、设备日志、账号数据及本机交接记录不属于源码发布内容。构建生成物应留在 `build/` 并由 `.gitignore` 排除。
 
-## 无名 4G 源码变体
+## S31 统一网络实现
 
-`variants/wuming-4g/overlay/` 保存相对固定 v3.0.0 基线的源码差异；`manifest.json` 记录来源与校验值。`tools/materialize_wuming_4g.py` 还原完整工程到独立目录。详见 [4G 源码梳理](WUMING_4G_SOURCE.md) 和 [构建/刷写说明](WUMING_4G.md)。普通根目录构建不会包含 4G 变体。
+`components/cellular_modem/`、`components/uart_uhci/` 与 `components/espressif__iot_eth/` 提供蜂窝底层，仅 S31 构建依赖它们。`main/app/cellular_policy.c` 负责启动探测与 Wi-Fi 优先策略，`main/app/network_state.c` 统一业务在线判断及联网提示；Pico 使用无蜂窝实现。见 [统一固件说明](UNIFIED_S31_NETWORK.md)。
+
+`variants/wuming-4g/` 仅保留合并前的 3.0.0 来源快照及校验清单。`tools/materialize_wuming_4g.py` 用于历史复现；当前开发和构建不使用旧 overlay。设备构建视图会跳过整个 `variants/`，避免历史副本进入构建。

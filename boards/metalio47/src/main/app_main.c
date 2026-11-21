@@ -56,6 +56,8 @@ extern const app_desc_t app_onboarding;
 #include "vcom_setup.h"
 #include "debug_panel.h"
 #include "metalio_sleep.h"
+#include "cellular_policy.h"
+#include "read_pico_transfer.h"
 
 static const char* TAG = "read_pico";
 extern const app_desc_t app_boot_recovery;
@@ -169,6 +171,11 @@ void app_main(void) {
     (void)lock_pin_enabled();
     pico_boot_init(reset == ESP_RST_PANIC || reset == ESP_RST_INT_WDT ||
                    reset == ESP_RST_TASK_WDT || reset == ESP_RST_WDT);
+
+    // 4G 网络策略尽早启动：不依赖显示/SD/字体初始化，避免这些阻塞时无法联网。
+    // Start the cellular policy before display/SD/font bring-up so a slow init cannot delay it.
+    read_pico_transfer_set_external_network_ready(cellular_ready);
+    cellular_policy_start();
 
     read_pico_handle_t hw;
     if (read_pico_init(&hw) != ESP_OK) return;

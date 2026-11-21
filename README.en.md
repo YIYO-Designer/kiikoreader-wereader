@@ -30,8 +30,8 @@ GitHub Actions runs board builds and host-side checks. Verify the board, partiti
 
 Licensing varies by file and component. See [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md); do not treat the whole repository or historical firmware as covered by one license.
 
-## Wuming 4G variant (3.0.0)
+## Unified S31 Wi-Fi / Wuming 4G source
 
-The supplied EC718 / ESP32-S31 4G variant is preserved as a pinned v3.0.0 base plus a source overlay in [`variants/wuming-4g/`](variants/wuming-4g/). See [source, build and flashing instructions](docs/WUMING_4G.md) and the [file inventory](docs/WUMING_4G_SOURCE.md). Restore it with `python tools/materialize_wuming_4g.py --output build/wuming-4g/source` before building; the root project still builds the original S31/Pico firmware.
+The main source now builds one `metalio47` firmware for both S31 variants. A background AT-only probe detects the modem independently of SIM/network registration. Wi-Fi-only devices hide cellular settings/icons and receive Wi-Fi-only prompts. See [implementation, build and validation notes](docs/UNIFIED_S31_NETWORK.md).
 
-The existing [v3.0.0 release](https://github.com/YIYO-Designer/kiikoreader-wereader/releases/tag/v3.0.0) additionally provides only `Kiikoread_Metalio_S31_4G_full_16MB.bin` (16 MiB, write at `0x0`, erases internal flash). Some bundled IoT SIMs may not reach WeRead; use a compatible external SIM or Wi-Fi. This import does not claim fresh hardware testing.
+The [original 4G 3.0.0 overlay](variants/wuming-4g/) is retained as an archival snapshot. Build the current root project for unified firmware; historical release assets predate automatic detection.

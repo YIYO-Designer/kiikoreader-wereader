@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "src/uart_eth_modem.cc"
+        "src/cellular_modem.cpp"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_netif
+        esp_event
+        esp_timer
+        esp_driver_gpio
+        esp_driver_uart
+        esp_hw_support
+        lwip
+        uart_uhci
+        espressif__iot_eth
+)

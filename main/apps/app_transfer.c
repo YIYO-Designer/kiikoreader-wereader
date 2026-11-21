@@ -42,6 +42,7 @@
 #include "book_store.h"
 #include "book_progress.h"
 #include "book_title.h"
+#include "cellular_policy.h"
 #include "display.h"
 #if KIIKO_BOARD_METALIO47
 #include "display_main_waveform.h"
@@ -516,7 +517,24 @@ static app_redraw_t network_ui_tick(app_ctx_t* ctx) {
     // bitmaps before starting WiFi, then recreate them while drawing the result.
     // This prevents the hosted radio from competing with the UI cache at init.
     ttf_font_cache_clear();
+    /*
+     * 4G 在线时内部空闲只剩 47 KB，而 Wi-Fi 驱动起来要 63 KB——扫描必然 NO_MEM。所以先把蜂窝
+     * 链路拆掉再上射频：顺带避免两个射频同时抢 3.3 V 轨。60 s 只是兜底，扫描返回就立刻恢复。
+     * With 4G up, internal free is only 47 KB while the Wi-Fi driver needs 63 KB, so the scan can
+     * only fail with NO_MEM. Tear the cellular link down before the radio comes up, which also keeps
+     * two radios off the same 3.3 V rail. 60 s is a safety net; the scan releases it on return.
+     */
+#if KIIKO_BOARD_METALIO47
+    if (!cellular_policy_pause(60000)) {
+        s_scan_pending=true;
+        snprintf(s_network_message,sizeof(s_network_message),"正在准备 Wi-Fi 扫描…");
+        return APP_REDRAW_PAGE;
+    }
+#endif
     esp_err_t err = read_pico_transfer_scan_wifi(s_networks, &s_network_count);
+#if KIIKO_BOARD_METALIO47
+    cellular_policy_resume();
+#endif
     s_scan_error = err;
     if (err != ESP_OK) {
         s_network_count = 0;

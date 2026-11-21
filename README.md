@@ -1,6 +1,6 @@
 # kiikoreader WeRead（微信读书）固件
 
-面向 **kiikoreader Metalio S31** 的社区固件源码项目，以 `0.3.3-rc113` 为固件基线，集成微信读书书架、账户、书籍缓存、进度同步与阅读时长上报。项目沿用 kiikoreader 的本地书架、阅读器和系统字体设置。
+面向 **kiikoreader Metalio S31 Wi-Fi / 无名 4G** 的社区固件源码项目，以 `0.3.3-rc113` 为固件基线，集成微信读书书架、账户、书籍缓存、进度同步与阅读时长上报。项目沿用 kiikoreader 的本地书架、阅读器和系统字体设置。
 
 > 本项目不是腾讯、微信读书或 Metalio/kiikoread 官方发布。微信读书接口为非公开服务接口，服务端策略、登录校验或网络要求变化可能影响功能。
 
@@ -51,8 +51,8 @@ Metalio S31 0.3.3-rc113 最终版 16 MiB 全闪存镜像与 Windows 使用说明
 
 请勿提交 Cookie、登录二维码、账户凭据、NVS 导出、设备日志或含有个人书籍信息的截图。发现凭据泄露请立即在微信读书端撤销登录会话，并按 [`SECURITY.md`](SECURITY.md) 报告安全问题。
 
-## 无名 4G 版（3.0.0）
+## Wi-Fi / 无名 4G 统一固件
 
-现已同时收录无名 4G 版微读源码。它基于 v3.0.0，增加 EC718 蜂窝网络、双卡选择和 Wi-Fi 优先策略，作为独立源码变体保存在 [`variants/wuming-4g/`](variants/wuming-4g/)。完整功能、源码还原、构建、刷写和卡片限制见 [`docs/WUMING_4G.md`](docs/WUMING_4G.md)，逐文件梳理见 [`docs/WUMING_4G_SOURCE.md`](docs/WUMING_4G_SOURCE.md)。
+当前主源码已合并两种 S31 设备，使用同一 `metalio47` 构建目标和相同分区布局。后台以模组 AT 响应识别蜂窝能力：Wi-Fi 机隐藏 4G/SIM 设置与状态栏图标，联网提示只显示 Wi-Fi；4G 机保留 SIM 选择和 Wi-Fi 优先策略，无卡或无信号不会被判为 Wi-Fi 机。完整实现与验证范围见 [`docs/UNIFIED_S31_NETWORK.md`](docs/UNIFIED_S31_NETWORK.md)。
 
-[v3.0.0 发行版](https://github.com/YIYO-Designer/kiikoreader-wereader/releases/tag/v3.0.0) 额外提供 `Kiikoread_Metalio_S31_4G_full_16MB.bin`，大小 16 MiB，从 `0x0` 写入并清空内部闪存。请根据设备选择普通 S31 或无名 4G 镜像。
+此前单独收录的 [4G 3.0.0 源码快照](variants/wuming-4g/) 与 [原发行版](https://github.com/YIYO-Designer/kiikoreader-wereader/releases/tag/v3.0.0) 保留用于追溯。日常开发直接修改主源码并按上面的统一构建命令构建，无需还原旧覆盖目录。已发布附件属于合并前的版本，不能据此认定已含自动识别功能。

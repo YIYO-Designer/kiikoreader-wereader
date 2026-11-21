@@ -93,6 +93,8 @@ static bool reader_full_pages_valid(uint8_t pages) {
 #define NVS_KEY_READER_KEYS_V2 "rd_keys_v2"
 #define NVS_KEY_VERTICAL_TURN "rd_vertical"
 #define NVS_KEY_BLE_TURNER "ble_turn"
+#define NVS_KEY_CELLULAR "cell_en"
+#define NVS_KEY_SIM_SLOT "sim_sel"
 #define NVS_KEY_FAST_CHARGE "fast_chg"
 #define NVS_KEY_SHELF_RECENT "shelf_recent"
 #define NVS_KEY_BOOK_LINE "bk_line"
@@ -164,6 +166,10 @@ static uint8_t s_reader_hold_action = APP_READER_KEY_HOME;
 static uint8_t s_reader_keys[3] = {APP_READER_KEY_PREV, APP_READER_KEY_TOOLS, APP_READER_KEY_NEXT};
 static bool s_reader_vertical_turn;
 static bool s_ble_turner;
+// 4G默认开启：无Wi-Fi时自动拨号；用户显式关闭后回退到提示连Wi-Fi。
+// Cellular on by default: dial when no Wi-Fi; user turning it off falls back to Wi-Fi prompt.
+static bool s_cellular_enabled = true;
+static app_sim_slot_t s_sim_slot = APP_SIM_AUTO;
 // 快充默认开启：首次上电即 1.5A，用户关闭后才回到标准 1A。
 // Fast charge is on by default: 1.5 A from first boot, standard 1 A only after the user turns it off.
 static bool s_fast_charge = true;
@@ -391,6 +397,11 @@ void app_settings_init(void) {
     uint8_t hide_images = 0, recent_sort = 0, ble_turner = 0, book_fonts = 1, book_vertical = 0;
     if (nvs_get_u8(h, NVS_KEY_HIDE_IMAGES, &hide_images) == ESP_OK) s_reader_hide_images = hide_images == 1;
     if (nvs_get_u8(h, NVS_KEY_BLE_TURNER, &ble_turner) == ESP_OK) s_ble_turner = ble_turner == 1;
+    uint8_t cellular = 1;
+    if (nvs_get_u8(h, NVS_KEY_CELLULAR, &cellular) == ESP_OK) s_cellular_enabled = cellular != 0;
+    uint8_t sim_slot = APP_SIM_AUTO;
+    if (nvs_get_u8(h, NVS_KEY_SIM_SLOT, &sim_slot) == ESP_OK && sim_slot <= APP_SIM_INTERNAL)
+        s_sim_slot = (app_sim_slot_t)sim_slot;
     uint8_t fast_charge = 1;
     if (nvs_get_u8(h, NVS_KEY_FAST_CHARGE, &fast_charge) == ESP_OK) s_fast_charge = fast_charge != 0;
 #if KIIKO_BOARD_METALIO47
@@ -865,6 +876,18 @@ esp_err_t app_settings_set_ai_short(app_ai_action_t action){
 }
 #endif
 bool app_settings_ble_turner(void) { return s_ble_turner; }
+bool app_settings_cellular_enabled(void) { return s_cellular_enabled; }
+void app_settings_set_cellular_enabled(bool on) {
+    if (s_cellular_enabled == on) return;
+    s_cellular_enabled = on;
+    nvs_put_u8(NVS_KEY_CELLULAR, on ? 1 : 0);
+}
+app_sim_slot_t app_settings_sim_slot(void) { return s_sim_slot; }
+void app_settings_set_sim_slot(app_sim_slot_t slot) {
+    if (slot > APP_SIM_INTERNAL || s_sim_slot == slot) return;
+    s_sim_slot = slot;
+    nvs_put_u8(NVS_KEY_SIM_SLOT, (uint8_t)slot);
+}
 app_reader_key_action_t app_settings_reader_key_action(unsigned key) {
     return key < 3 ? (app_reader_key_action_t)s_reader_keys[key] : APP_READER_KEY_NONE;
 }

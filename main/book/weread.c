@@ -1,3 +1,4 @@
+#include "app/network_state.h"
 #include "weread_internal.h"
 
 #include <ctype.h>
@@ -382,11 +383,24 @@ static bool add_stats(const char *owner, unsigned seconds) {
     return result == ESP_OK;
 }
 
-bool wr_online(void) {
-    read_pico_transfer_status_t status;
-    read_pico_transfer_get_status(&status);
-    return status.network_ready && status.mode == READ_PICO_TRANSFER_MODE_STA;
+/* 扫码登录的 getLoginInfo 是长轮询：服务端先把连接挂住，再随扫码状态回包，正常态实测
+ * 4–13 秒才出响应头。4G(CAT.1) 的 RTT 比 Wi-Fi 高，15 秒预算正好卡在响应到达前一秒放弃，
+ * 二维码就永远出不来。只在登录期间把读预算放宽到 40 秒，其他请求仍按 15 秒判死。
+ * getLoginInfo is a long poll: the server parks the connection and answers once the QR state
+ * changes, measured at 4-13 s before the response headers appear. CAT.1 cellular adds enough
+ * RTT that a 15 s budget expires just before the answer lands. Only the login flow gets 40 s;
+ * every other request still fails fast at 15 s. */
+#define WR_HTTP_READ_TIMEOUT_MS 15000
+#define WR_HTTP_LOGIN_READ_TIMEOUT_MS 40000
+static volatile bool s_login_http_slow;
+
+static uint32_t wr_http_read_timeout_ms(void) {
+    return s_login_http_slow ? WR_HTTP_LOGIN_READ_TIMEOUT_MS : WR_HTTP_READ_TIMEOUT_MS;
 }
+
+bool wr_online(void) { return app_network_ready(); }
+
+static const char *network_failure_text(void) { return app_network_failure_text(); }
 
 bool wr_safe(const char *value) {
     if (!value || !*value) return false;
@@ -608,8 +622,13 @@ static esp_http_client_handle_t http_keepalive_get(const char *url, wr_http_cont
     }
     if (!s_http_keepalive) {
         esp_http_client_config_t config = {
-            .url = url, .timeout_ms = 15000, .buffer_size = WR_HTTP_BUFFER, .buffer_size_tx = 2048,
+            .url = url, .timeout_ms = wr_http_read_timeout_ms(), .buffer_size = WR_HTTP_BUFFER, .buffer_size_tx = 2048,
             .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
+            /* 4G(CAT.1 NAT 网口)只有 IPv4，没有 IPv6 路由。默认的 AF_UNSPEC 会让
+             * getaddrinfo 优先返回 AAAA 记录，socket 连 IPv6 永远 EINPROGRESS 直到超时；
+             * 强制 IPv4 让 4G/Wi-Fi 都能连。Force IPv4: the cellular NAT netif has no
+             * IPv6 route, and AF_UNSPEC getaddrinfo prefers AAAA -> connect never completes. */
+            .addr_type = HTTP_ADDR_TYPE_INET,
             .keep_alive_enable = true, .keep_alive_idle = 30, .keep_alive_interval = 5,
             .keep_alive_count = 2, .user_agent = WR_AGENT,
             .event_handler = capture_keepalive_event, .user_data = request,
@@ -717,7 +736,7 @@ static char *http_request_reusable(wr_http_context_t *request, const char *url, 
      */
     if (!wr_online()) {
         http_keepalive_drop();
-        wr_error_set("网络未连接，请先在快捷菜单连上 Wi-Fi");
+        wr_error_set(app_network_offline_text());
         ESP_LOGW("WEREAD", "request blocked offline url=%s", url);
         return NULL;
     }
@@ -819,7 +838,7 @@ static char *http_request_reusable(wr_http_context_t *request, const char *url, 
             else if (wr_cancelled()) wr_error_set("操作已取消");
             else if (tls_error != ESP_OK || result == ESP_ERR_HTTP_CONNECT) {
                 s_http_open_failed = true;
-                wr_error_set("微信读书网络连接失败，请检查 Wi-Fi 后重试");
+                wr_error_set(network_failure_text());
             } else wr_error_set("读取微信读书响应失败");
             ESP_LOGW("WEREAD", "HTTP perform failed url=%s err=%s tls=%s code=%d flags=0x%x bytes=%u",
                      url, esp_err_to_name(result), esp_err_to_name(tls_error), tls_code,
@@ -1029,7 +1048,7 @@ static char *http_request_stream(const char *url, const char *body, const char *
     const int64_t request_started_us = esp_timer_get_time();
     s_http_open_failed = false;
     if (wr_cancelled()) { s_error_message = "操作已取消"; return NULL; }
-    if (!wr_online()) { http_keepalive_drop(); s_error_message = "Wi-Fi 未连接或网络尚未就绪"; return NULL; }
+    if (!wr_online()) { http_keepalive_drop(); s_error_message = app_network_offline_text(); return NULL; }
     /*
      * 建 TLS 前先看内部 RAM。前一次改动的教训：这里一旦"余量不够就不发请求"，在这块板上
      * 就是永久失败——实测 worker 起时只有 25 KB，44 KB 的门槛把所有章包和上报都拒了。
@@ -1084,10 +1103,12 @@ static char *http_request_stream(const char *url, const char *body, const char *
     esp_http_client_config_t config = {
         /* Keep the HTTP/TLS working set modest on S31: the panel and Wi-Fi
          * driver need internal RAM while mbedTLS allocates AES/GCM contexts. */
-        .url = absolute, .timeout_ms = 15000, .buffer_size = WR_HTTP_BUFFER, .buffer_size_tx = 2048,
+        .url = absolute, .timeout_ms = wr_http_read_timeout_ms(), .buffer_size = WR_HTTP_BUFFER, .buffer_size_tx = 2048,
         /* open/fetch_headers/read is the streaming API; it needs an explicit
          * redirect loop because perform() is not used here. */
         .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
+        /* 4G NAT 网口无 IPv6 路由：强制 IPv4，避免 AAAA 记录导致 connect 超时。 */
+        .addr_type = HTTP_ADDR_TYPE_INET,
         .user_agent = WR_AGENT, .event_handler = capture_cookie, .user_data = request,
     };
     esp_http_client_handle_t http = esp_http_client_init(&config);
@@ -1135,7 +1156,7 @@ static char *http_request_stream(const char *url, const char *body, const char *
         esp_err_t open_error = esp_http_client_open(http, body_size);
         if (open_error != ESP_OK) {
             s_http_open_failed = true;
-            s_error_message = "微信读书网络连接失败，请检查 Wi-Fi 后重试";
+            s_error_message = network_failure_text();
             int tls_code = 0, tls_flags = 0;
             esp_err_t tls_error = esp_http_client_get_and_clear_last_tls_error(http, &tls_code, &tls_flags);
             ESP_LOGW("WEREAD", "HTTP open failed url=%s err=%s ms=%lld tls=%s code=%d flags=0x%x internal=%u largest=%u",
@@ -2300,7 +2321,12 @@ static void run_work(const wr_work_t *work) {
         uint32_t utc;
         (void)read_pico_transfer_sync_time_online(&utc);
     }
-    if (work->kind == WR_LOGIN) ok = login();
+    if (work->kind == WR_LOGIN) {
+        /* 登录是长轮询，这段时间里不会有别的网络任务并发，放宽读预算不会波及别人。 */
+        s_login_http_slow = true;
+        ok = login();
+        s_login_http_slow = false;
+    }
     else if (s_http_account.token[0] && !wr_cancelled()) {
         switch (work->kind) {
         case WR_CHECK: ok = check_session(); break;
@@ -3017,7 +3043,7 @@ bool wr_open_book(const wr_book_t *book, char path[WR_PATH], unsigned *start) {
          * A book whose TOC is already on disk opens offline; only a first open that needs the TOC
          * over the network is refused, and it says "no network" instead of a vague fetch failure. */
         wr_error_set(wr_online() ? "章节目录获取失败，请稍后重试"
-                                 : "网络未连接，请先在快捷菜单连上 Wi-Fi");
+                                 : app_network_offline_text());
         return false;
     }
     if (!wr_cache_dir(book)) {

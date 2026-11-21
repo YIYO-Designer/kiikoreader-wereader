@@ -212,6 +212,24 @@ void app_settings_set_shelf_recent_sort(bool on);
 /// by default. Turning it off tears the whole stack down and returns NimBLE's memory.
 bool app_settings_ble_turner(void);
 void app_settings_set_ble_turner(bool on);
+/// 4G蜂窝网络：默认开启；关闭后不再拨号，微读无Wi-Fi时改回提示连接Wi-Fi。
+/// 有Wi-Fi时始终优先Wi-Fi并自动断开4G。/ Cellular data: on by default; when off the modem is not
+/// dialed and WeRead falls back to prompting for Wi-Fi. Wi-Fi always wins when available.
+bool app_settings_cellular_enabled(void);
+void app_settings_set_cellular_enabled(bool on);
+
+/* 双卡选择：0 = 自动（卡托优先，无卡退回内置），1 = 只用卡托卡，2 = 只用内置物联网卡。
+ * 机器内置一张焊死的物联网卡，卡托可另插普通手机卡，两张卡的上网出口行为并不一样。
+ * Dual SIM: 0 = auto (tray first, fall back to the soldered card), 1 = tray only,
+ * 2 = internal IoT card only. */
+typedef enum {
+    APP_SIM_AUTO = 0,
+    APP_SIM_TRAY = 1,
+    APP_SIM_INTERNAL = 2,
+} app_sim_slot_t;
+
+app_sim_slot_t app_settings_sim_slot(void);
+void app_settings_set_sim_slot(app_sim_slot_t slot);
 /// S31快充：默认开启；关闭回到标准充电电流，切换立即生效并掉电保存。/ S31 fast charge: on by default; off returns to the standard current, and the choice persists.
 bool app_settings_fast_charge(void);
 void app_settings_set_fast_charge(bool on);

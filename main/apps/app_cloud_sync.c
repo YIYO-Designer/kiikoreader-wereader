@@ -14,6 +14,7 @@
  * Frozen: batch downloads require an explicit one-click sync action; failed checks are never kept; unbind only
  *       clears local tokens; render paints only.
  */
+#include "app/network_state.h"
 #include <stdio.h>
 // 网络/页面控制按体积编译，保留Pico原4MiB应用槽；协议、校验与任务时序不变。
 // Size-optimize IO/page control to retain Pico's4MiB slots without changing protocol,verification or task timing.
@@ -27,6 +28,7 @@
 #include "app_transfer_mode.h"
 #include "read_pico_transfer.h"
 #include "book_store.h"
+#include "esp_attr.h"
 #include "book_xteink_sync.h"
 #include "ui_gesture.h"
 #include "ui_kit.h"
@@ -52,7 +54,9 @@ static bool s_wifi_stage,s_wifi_live;
 static bool s_resume_refresh;
 static unsigned s_seen_revision;
 static unsigned s_seen_imports;
-static char s_qr[1024];
+/* 绑定二维码载荷 1 KB，只在绑定页用到；内部 DRAM 留给射频与 TLS。
+ * The 1 KB binding payload is only live on the bind page; internal DRAM goes to radio/TLS. */
+EXT_RAM_BSS_ATTR static char s_qr[1024];
 
 static EpdRect row_rect(int index) {
     return (EpdRect){36, CLOUD_ROW_TOP + index * CLOUD_ROW_STEP, 612, CLOUD_ROW_HEIGHT};
@@ -100,6 +104,11 @@ static void sync_qr(const xteink_sync_status_t* status) {
 // 在同一导入页内复用已有配网 UI，保留返回来源及密码键盘的原刷新/手势。
 // Embed existing provisioning so returning retains the caller and keyboard refresh/gestures.
 static void cloud_wifi_open(app_ctx_t* ctx) {
+    if (app_network_ready()) {
+        s_wifi_stage=s_wifi_live=false;
+        xteink_sync_start();
+        return;
+    }
     s_wifi_stage=s_wifi_live=true;
     app_transfer_request_wifi_setup();
     if(app_transfer.on_enter)app_transfer.on_enter(ctx);
