@@ -23,6 +23,8 @@ typedef int esp_err_t;
 #define ESP_FAIL -1
 #define ESP_ERR_NO_MEM 0x101
 #define ESP_ERR_TIMEOUT 0x107
+#define ESP_ERR_INVALID_STATE 0x103
+#define ESP_ERR_NOT_FINISHED 0x10c
 #define ESP_LOGI(...) ((void)0)
 #define pdMS_TO_TICKS(x) (x)
 #define pdTRUE 1
@@ -66,12 +68,16 @@ int main(void) {
 
 POLICY = r'''
 static int scenario, probes, deinits, starts, stops, iterations, notifications;
-static bool create_ok=true, fail_dial;
+static bool create_ok=true, fail_dial, cancelled;
+bool cellular_policy_pause(uint32_t ms);
+void cellular_policy_resume(void);
+void cellular_policy_request_restart(void);
+static void delay_hook(unsigned ms);
 static int64_t now_us;
 static jmp_buf finished;
 static void (*task_fn)(void*);
 static int64_t esp_timer_get_time(void) { return now_us; }
-static void vTaskDelay(unsigned ms) { now_us+=(int64_t)ms*1000; }
+static void vTaskDelay(unsigned ms) { now_us+=(int64_t)ms*1000;delay_hook(ms); }
 static void vTaskDelete(void *unused) { (void)unused;longjmp(finished,1); }
 static TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (void*)1; }
 static int xTaskCreate(void(*fn)(void*),const char*n,unsigned stack,void*a,int p,void*h) {
@@ -80,22 +86,44 @@ static int xTaskCreate(void(*fn)(void*),const char*n,unsigned stack,void*a,int p
 static void xTaskNotifyGive(TaskHandle_t h) { assert(h==(void*)1);++notifications; }
 static unsigned ulTaskNotifyTake(int clear,unsigned ms);
 static esp_err_t cellular_modem_init_default(void) { return scenario==5?ESP_ERR_NO_MEM:ESP_OK; }
-static esp_err_t cellular_modem_probe(void) { ++probes;return scenario==0?ESP_FAIL:ESP_OK; }
-static void cellular_modem_cancel(void) {}
+static esp_err_t cellular_modem_probe(void) {
+    ++probes;
+    if ((scenario==8 || scenario==10) && probes==1) {
+        assert(!cellular_policy_pause(60000));
+        if (scenario==10) cellular_policy_resume();
+        return scenario==10?ESP_ERR_NOT_FINISHED:ESP_FAIL;
+    }
+    return scenario==0?ESP_FAIL:ESP_OK;
+}
+static void cellular_modem_cancel(void) { cancelled=true; }
 static void cellular_modem_deinit(void) { ++deinits;cell=false; }
 static bool cellular_modem_is_ready(void) { return cell; }
-static void cellular_modem_stop(void) { ++stops;cell=false; }
+static void cellular_modem_stop(void) { ++stops;cell=false;cancelled=false; }
 static void cellular_modem_set_sim_mode(int slot) { assert(slot==2); }
 static esp_err_t cellular_modem_start(uint32_t ms) {
-    assert(ms==60000);++starts;cell=!fail_dial;return fail_dial?ESP_ERR_TIMEOUT:ESP_OK;
+    assert(ms==60000);++starts;
+    if (scenario==7) assert(!cellular_policy_pause(60000));
+    if (scenario==9) { enabled=false;cellular_policy_request_restart(); }
+    cell=!fail_dial&&!cancelled;
+    return cell?ESP_OK:ESP_ERR_TIMEOUT;
 }
 #include "app/cellular_policy.c"
+static void delay_hook(unsigned ms) {
+    if (scenario==8 && probes==1 && ms==100 && atomic_load(&s_pause_ack)) {
+        assert(cellular_capability()==CELLULAR_CAPABILITY_UNKNOWN);
+        cellular_policy_resume();
+    }
+}
 static unsigned ulTaskNotifyTake(int clear,unsigned ms) {
     (void)clear;now_us+=(int64_t)ms*1000;
     ++iterations;
     if (iterations==8 && scenario==4) {
         assert(cellular_available() && cellular_ready());
         wifi=true;
+    }
+    if (scenario==7 && iterations==7) {
+        assert(atomic_load(&s_pause_ack) && !cell);
+        cellular_policy_resume();enabled=false;
     }
     if (iterations>12) longjmp(finished,1);
     return 0;
@@ -114,12 +142,14 @@ int main(int argc,char **argv) {
         assert(cellular_capability()==CELLULAR_CAPABILITY_NOT_DETECTED);
         assert(probes==(scenario==0?1:0));
     } else {
-        assert(cellular_available() && probes==1 && !deinits);
+        assert(cellular_available());
+        if (scenario==8 || scenario==10) assert(probes==2 && deinits==1);
+        else assert(probes==1 && !deinits);
         if (scenario==1) assert(!starts && !cellular_ready());
         else if (scenario==3) assert(starts==1 && !cellular_ready());
-        else if (scenario==4) assert(starts==1 && !cellular_ready() && stops);
+        else if (scenario==4 || scenario==7 || scenario==9) assert(starts==1 && !cellular_ready() && stops);
         else assert(starts==1 && cellular_ready());
-        cellular_policy_request_restart();assert(notifications==1);
+        unsigned before=notifications;cellular_policy_request_restart();assert(notifications==before+1);
     }
     printf("PASS: real boot policy scenario %d\n",scenario);
 }
@@ -158,7 +188,7 @@ def run():
             subprocess.run([str(binary)], check=True)
 
         binary = compile_case('policy', POLICY)
-        for scenario in range(7):
+        for scenario in range(11):
             subprocess.run([str(binary), str(scenario)], check=True)
 
         settings = ROOT / 'main/apps/app_device_settings.c'

@@ -11,6 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Select Clang for host regressions
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/kiiko-network-cc"
+          ln -s "$(command -v clang)" "$RUNNER_TEMP/kiiko-network-cc/cc"
+          echo "$RUNNER_TEMP/kiiko-network-cc" >> "$GITHUB_PATH"
       - name: Unified S31 network and capability regressions
         run: |
           python3 tools/unified_network_host_test.py

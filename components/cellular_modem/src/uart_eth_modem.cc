@@ -109,7 +109,7 @@ esp_err_t UartEthModem::Probe(const std::atomic<bool>* cancel) {
             vTaskDelay(pdMS_TO_TICKS(20));
         }
         result = probe_result_.load();
-        if (cancel->load()) result = ESP_ERR_INVALID_STATE;
+        if (cancel->load()) result = ESP_ERR_NOT_FINISHED;
         else if (result == ESP_ERR_NOT_FINISHED) result = ESP_ERR_TIMEOUT;
     }
     // Stop joins every transport task before releasing GPIO/DMA/queues.

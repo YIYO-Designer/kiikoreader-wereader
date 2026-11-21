@@ -69,7 +69,8 @@ bool cellular_modem_get_info(cellular_modem_info_t *out);
 /* Convenience: default S31 pins (TX58 RX59 MRDY60 SRDY3, UART2 @2Mbps). */
 esp_err_t cellular_modem_init_default(void);
 
-/* Framed AT-only presence probe. No SIM required; releases transport resources. */
+/* Framed AT-only probe. No SIM required; releases transport resources.
+ * ESP_ERR_NOT_FINISHED means cancelled, not evidence of absent hardware. */
 esp_err_t cellular_modem_probe(void);
 void cellular_modem_deinit(void);
 

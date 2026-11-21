@@ -80,7 +80,7 @@ static void policy_task(void *arg) {
         cellular_modem_stop(); // clears a cancellation from an earlier pause
         result=cellular_modem_init_default();
         if (result==ESP_OK) result=cellular_modem_probe();
-        if (atomic_load(&s_paused_until_s)) {
+        if (atomic_load(&s_paused_until_s) || result==ESP_ERR_NOT_FINISHED) {
             cellular_modem_deinit();
             continue; // a cancelled probe cannot identify a Wi-Fi-only device
         }
