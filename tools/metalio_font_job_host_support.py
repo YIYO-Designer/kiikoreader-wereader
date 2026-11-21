@@ -17,18 +17,23 @@ typedef struct {char path[160];}ttf_font_prepared_t;
 typedef struct {char path[160];atomic_bool cancel,done;ttf_font_prepared_t *prepared;esp_err_t error;bool ext_stack;}reader_font_job_t;
 static reader_font_job_t *s_font_job;
 static void (*queued_worker)(void *);static void *queued_arg;
-static bool create_fails;
+static bool create_fails, caps_create_fails;
+static unsigned caps_deletes, normal_deletes;
 static unsigned retired;
 static int xTaskCreate(void(*fn)(void*),const char*name,unsigned stack,void*arg,int priority,void*handle){
  (void)name;(void)stack;(void)priority;(void)handle;if(create_fails)return 0;assert(!queued_worker);queued_worker=fn;queued_arg=arg;return pdPASS;}
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT 2
 static int xTaskCreateWithCaps(void(*fn)(void*),const char*name,unsigned stack,void*arg,int priority,void*handle,unsigned caps){
- assert(caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));return xTaskCreate(fn,name,stack,arg,priority,handle);}
-static void vTaskDeleteWithCaps(void*p){assert(!p);}
+ assert(caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));if(caps_create_fails)return 0;return xTaskCreate(fn,name,stack,arg,priority,handle);}
+static void vTaskDeleteWithCaps(void*p){assert(!p);++caps_deletes;}
 static void run_worker(void){if(queued_worker){void(*fn)(void*)=queued_worker;void*arg=queued_arg;queued_worker=NULL;fn(arg);}}
-static void vTaskDelete(void*p){assert(!p);}
+static void vTaskDelete(void*p){assert(!p);++normal_deletes;}
 static void vTaskDelay(int n){assert(n==1);run_worker();}
+static int app_settings_book_weight_fine(void){return 0;}
+static bool app_settings_book_antialias(void){return true;}
+static void ttf_set_stroke_adjust_fine(int value){(void)value;}
+static void ttf_set_antialias(bool enabled){(void)enabled;}
 static ttf_font_prepared_t *ttf_font_prepare(const char *path,const atomic_bool *cancel,esp_err_t *error){
  ++opens;*error=-1;if(load_fails||atomic_load(cancel))return NULL;
  ttf_font_prepared_t *p=calloc(1,sizeof(*p));assert(p);snprintf(p->path,sizeof(p->path),"%s",path);*error=ESP_OK;return p;}
